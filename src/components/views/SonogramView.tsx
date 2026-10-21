@@ -21,7 +21,7 @@
  * 4. High-Precision Inspection Tools:
  *    - Freeze / Pause Frame buffer
  *    - Crosshair reticle with Hz, Note + Cents, dBFS, and Dominant Track
- *    - Harmonic Series Guides (f0, 2f0, 3f0, 4f0, 5f0)
+ *    - Logarithmic frequency grid with piano roll overlay
  *    - Translucent glow piano roll with key contour alignment
  *    - Zero audio coloration (100% bit-transparent measurement instrument)
  */
@@ -109,7 +109,9 @@ export const SonogramView: React.FC<SonogramViewProps> = ({ tracks, settings }) 
   const [speed, setSpeed] = useState<number>(settings.sonogramSpeed || 2);
   const [isFrozen, setIsFrozen] = useState<boolean>(false);
   const [showPianoRoll, setShowPianoRoll] = useState<boolean>(true);
-  const [showHarmonics, setShowHarmonics] = useState<boolean>(true);
+  // Read by the long-lived canvas loop and its drawing helpers
+  const showPianoRollRef = useRef(showPianoRoll);
+  showPianoRollRef.current = showPianoRoll;
   const [sensitivityDb, setSensitivityDb] = useState<number>(-80); // Min floor
   const [colorGain, setColorGain] = useState<number>(1.2); // Contrast / Intensity
 
@@ -454,7 +456,7 @@ export const SonogramView: React.FC<SonogramViewProps> = ({ tracks, settings }) 
         drawVerticalFrequencyGrid(ctx, width, height);
 
         // Piano roll bottom strip
-        if (showPianoRoll) {
+        if (showPianoRollRef.current) {
           drawBottomPianoRoll(ctx, width, height);
         }
         ctx.restore();
@@ -661,12 +663,12 @@ export const SonogramView: React.FC<SonogramViewProps> = ({ tracks, settings }) 
       ctx.setLineDash([2, 4]);
       ctx.beginPath();
       ctx.moveTo(x, 0);
-      ctx.lineTo(x, height - (showPianoRoll ? 22 : 0));
+      ctx.lineTo(x, height - (showPianoRollRef.current ? 22 : 0));
       ctx.stroke();
 
       // Label at bottom
       ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
-      ctx.fillText(f >= 1000 ? `${f / 1000}k` : `${f}`, x, height - (showPianoRoll ? 26 : 8));
+      ctx.fillText(f >= 1000 ? `${f / 1000}k` : `${f}`, x, height - (showPianoRollRef.current ? 26 : 8));
     });
     ctx.setLineDash([]);
   };
@@ -976,7 +978,7 @@ export const SonogramView: React.FC<SonogramViewProps> = ({ tracks, settings }) 
             <span>{isFrozen ? 'FROZEN' : 'Freeze'}</span>
           </button>
 
-          {/* Piano Roll & Harmonics Toggles (for waterfall projection) */}
+          {/* Piano Roll Toggle (for waterfall projection) */}
           {projection === 'waterfall' && (
             <div className="flex items-center gap-1 bg-slate-950/85 backdrop-blur-2xl p-1 rounded-2xl border border-white/10">
               <button
@@ -987,15 +989,6 @@ export const SonogramView: React.FC<SonogramViewProps> = ({ tracks, settings }) 
                 title="Toggle Glowing Piano Roll Overlay"
               >
                 <Music className="w-3.5 h-3.5" />
-              </button>
-              <button
-                onClick={() => setShowHarmonics(!showHarmonics)}
-                className={`p-1.5 rounded-xl transition-colors cursor-pointer ${
-                  showHarmonics ? 'bg-cyan-500/20 text-cyan-400' : 'text-slate-500 hover:text-slate-300'
-                }`}
-                title="Toggle Harmonic Series Markers"
-              >
-                <Compass className="w-3.5 h-3.5" />
               </button>
             </div>
           )}

@@ -4,7 +4,11 @@
  * ITU-R BS.1770 Loudness Metering, Stereo Goniometer, and Synchronized Oscilloscope.
  */
 
-import { AudioTrack, CollisionEvent, LoudnessMetrics, StereoMetrics, AnalyzerSettings } from '../types/audio';
+import { AudioTrack, CollisionEvent, LoudnessMetrics, StereoMetrics } from '../types/audio';
+import { BS1770Meter } from './loudness';
+
+// Seconds of audio kept per track for the oscilloscope / phase tools
+const RING_SECONDS = 10;
 
 interface TrackNodes {
   sourceNode: AudioNode | null;
@@ -30,6 +34,7 @@ export interface OscilloscopeChannelData {
 export class AudioEngine {
   private ctx: AudioContext | null = null;
   private isRunning: boolean = false;
+  private fftSize: number = 4096;
   private tracks: Map<string, TrackNodes> = new Map();
   private trackRingBuffers: Map<string, { buffer: Float32Array; writeIndex: number }> = new Map();
   private silentGain: GainNode | null = null;
@@ -61,6 +66,7 @@ export class AudioEngine {
   // Custom audio & mic inputs
   private micStream: MediaStream | null = null;
   private micSource: MediaStreamAudioSourceNode | null = null;
+  private micTrackId: string | null = null;
   private customAudioBuffers: Map<string, AudioBuffer> = new Map();
   private customAudioSources: Map<string, AudioBufferSourceNode> = new Map();
 
@@ -68,9 +74,10 @@ export class AudioEngine {
   private testSignalOsc: OscillatorNode | null = null;
   private testSignalGain: GainNode | null = null;
 
-  // Loudness accumulation buffers (ITU-R BS.1770)
-  private loudnessHistory: number[] = [];
-  private shortTermHistory: number[] = [];
+  // ITU-R BS.1770-4 loudness meter fed by a stereo tap on the master bus
+  private loudnessMeter: BS1770Meter | null = null;
+  private loudnessTap: ScriptProcessorNode | null = null;
+  private trackMeters: Map<string, BS1770Meter> = new Map();
 
   constructor() {
     // AudioContext will be initialized on first user gesture
@@ -83,7 +90,7 @@ export class AudioEngine {
 
       // Master output
       this.masterGain = this.ctx.createGain();
-      this.masterGain.gain.setValueAtTime(0.85, this.ctx.currentTime);
+      this.masterGain.gain.setValueAtTime(1.0, this.ctx.currentTime);
 
       this.masterAnalyser = this.ctx.createAnalyser();
       this.masterAnalyser.fftSize = 4096;
@@ -110,6 +117,19 @@ export class AudioEngine {
       this.silentGain = this.ctx.createGain();
       this.silentGain.gain.setValueAtTime(0, this.ctx.currentTime);
       this.silentGain.connect(this.ctx.destination);
+
+      // Stereo loudness tap (explicit 2-channel input so the master is not down-mixed)
+      this.loudnessMeter = new BS1770Meter(this.ctx.sampleRate, 2);
+      const meter = this.loudnessMeter;
+      this.loudnessTap = this.ctx.createScriptProcessor(2048, 2, 1);
+      this.loudnessTap.channelCount = 2;
+      this.loudnessTap.channelCountMode = 'explicit';
+      this.loudnessTap.channelInterpretation = 'speakers';
+      this.loudnessTap.onaudioprocess = (e) => {
+        meter.process([e.inputBuffer.getChannelData(0), e.inputBuffer.getChannelData(1)]);
+      };
+      this.masterGain.connect(this.loudnessTap);
+      this.loudnessTap.connect(this.silentGain);
     }
 
     if (this.ctx.state === 'suspended') {
@@ -119,7 +139,7 @@ export class AudioEngine {
     this.isRunning = true;
   }
 
-  public registerTrack(track: AudioTrack, fftSize: number = 4096): void {
+  public registerTrack(track: AudioTrack, fftSize: number = this.fftSize): void {
     if (!this.ctx || !this.masterGain) return;
 
     // Remove existing nodes if any
@@ -157,22 +177,31 @@ export class AudioEngine {
     splitterNode.connect(leftAnalyserNode, 0);
     splitterNode.connect(rightAnalyserNode, 1);
 
-    // Continuous 10-second (480,000 samples at 48kHz) multi-track ring buffer recorder
-    const RING_SIZE = 480000;
+    // Continuous 10-second multi-track ring buffer recorder (sized for the actual sample rate)
+    const RING_SIZE = Math.round(this.ctx.sampleRate * RING_SECONDS);
     const ring = {
       buffer: new Float32Array(RING_SIZE),
       writeIndex: 0,
     };
     this.trackRingBuffers.set(track.id, ring);
 
-    const processorNode = this.ctx.createScriptProcessor(2048, 1, 1);
+    // Per-track K-weighted meter (true peak skipped: it runs on the main thread for every track)
+    const trackMeter = new BS1770Meter(this.ctx.sampleRate, 2, { truePeak: false });
+    this.trackMeters.set(track.id, trackMeter);
+
+    const processorNode = this.ctx.createScriptProcessor(2048, 2, 1);
+    processorNode.channelCount = 2;
+    processorNode.channelCountMode = 'explicit';
     processorNode.onaudioprocess = (e) => {
-      const input = e.inputBuffer.getChannelData(0);
-      const len = input.length;
+      const left = e.inputBuffer.getChannelData(0);
+      const right = e.inputBuffer.getChannelData(1);
+      trackMeter.process([left, right]);
+
+      const len = left.length;
       const buf = ring.buffer;
       let wIdx = ring.writeIndex;
       for (let i = 0; i < len; i++) {
-        buf[wIdx] = input[i];
+        buf[wIdx] = 0.5 * (left[i] + right[i]);
         wIdx = (wIdx + 1) % RING_SIZE;
       }
       ring.writeIndex = wIdx;
@@ -211,17 +240,29 @@ export class AudioEngine {
       } catch {
         // Disconnection fallback
       }
+      nodes.processorNode.onaudioprocess = null;
       this.tracks.delete(trackId);
       this.trackRingBuffers.delete(trackId);
+      this.trackMeters.delete(trackId);
     }
   }
 
-  public updateTrackParameters(track: AudioTrack): void {
+  public hasTrack(trackId: string): boolean {
+    return this.tracks.has(trackId);
+  }
+
+  public getTrackIds(): string[] {
+    return Array.from(this.tracks.keys());
+  }
+
+  /** Applies volume / pan / mute; when any track is soloed every non-solo track is silenced. */
+  public updateTrackParameters(track: AudioTrack, anySolo: boolean = false): void {
     if (!this.ctx) return;
     const nodes = this.tracks.get(track.id);
     if (!nodes) return;
 
-    const targetGain = track.isMuted ? 0 : track.volume;
+    const isSilenced = track.isMuted || (anySolo && !track.isSolo);
+    const targetGain = isSilenced ? 0 : track.volume;
     nodes.gainNode.gain.setTargetAtTime(targetGain, this.ctx.currentTime, 0.02);
     nodes.panNode.pan.setTargetAtTime(track.pan, this.ctx.currentTime, 0.02);
   }
@@ -234,6 +275,7 @@ export class AudioEngine {
   }
 
   public setFftSize(size: number): void {
+    this.fftSize = size;
     this.tracks.forEach((nodes) => {
       try {
         nodes.analyserNode.fftSize = size;
@@ -350,7 +392,7 @@ export class AudioEngine {
       rmsR: this.smoothedRmsR,
       peakHoldL: this.peakHoldL,
       peakHoldR: this.peakHoldR,
-      maxPeakDb: currentMax,
+      maxPeakDb: this.masterMaxPeakDb,
       isClip: this.masterIsClip,
     };
   }
@@ -576,16 +618,28 @@ export class AudioEngine {
       await this.initAudio();
       if (!this.ctx) return false;
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const nodes = this.tracks.get(trackId);
+      if (!nodes) return false;
+
+      // Release any previous capture so the device is never held twice
+      this.disableMicrophone();
+
+      // Raw capture: browser voice processing would colour the measurement
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      });
       this.micStream = stream;
       this.micSource = this.ctx.createMediaStreamSource(stream);
+      this.micSource.connect(nodes.inputNode);
 
-      const nodes = this.tracks.get(trackId);
-      if (nodes) {
-        this.micSource.connect(nodes.inputNode);
-        return true;
+      // Analyse the mic but keep it off the speakers to avoid acoustic feedback
+      if (this.masterGain) {
+        try {
+          nodes.analyserNode.disconnect(this.masterGain);
+        } catch {}
       }
-      return false;
+      this.micTrackId = trackId;
+      return true;
     } catch (err) {
       console.warn('Microphone access rejected or failed:', err);
       return false;
@@ -602,6 +656,11 @@ export class AudioEngine {
     if (this.micStream) {
       this.micStream.getTracks().forEach((t) => t.stop());
       this.micStream = null;
+    }
+    if (this.micTrackId) {
+      const nodes = this.tracks.get(this.micTrackId);
+      if (nodes && this.masterGain) nodes.analyserNode.connect(this.masterGain);
+      this.micTrackId = null;
     }
   }
 
@@ -798,13 +857,20 @@ export class AudioEngine {
     return this.ctx ? this.ctx.sampleRate : 48000;
   }
 
+  /** FFT size shared by all per-track analysers (kept in sync by setFftSize). */
+  public getAnalyserFftSize(): number {
+    const first = this.tracks.values().next().value as TrackNodes | undefined;
+    return first ? first.analyserNode.fftSize : this.fftSize;
+  }
+
   // --- Psychoacoustic Frequency Collision Detection ---
   public detectCollisions(activeTracks: AudioTrack[], threshold: number = 0.45): CollisionEvent[] {
     if (!this.ctx || activeTracks.length < 2) return [];
 
     const collisions: CollisionEvent[] = [];
     const sampleRate = this.ctx.sampleRate;
-    const fftSize = 2048;
+    // Must match the analysers' real FFT size, otherwise every bin maps to the wrong frequency
+    const fftSize = this.getAnalyserFftSize();
     const binCount = fftSize / 2;
     const freqPerBin = sampleRate / fftSize;
 
@@ -909,7 +975,7 @@ export class AudioEngine {
 
   // --- ITU-R BS.1770-4 EBU R128 Loudness Metering ---
   public calculateLoudness(): LoudnessMetrics {
-    if (!this.masterAnalyser) {
+    if (!this.masterAnalyser || !this.loudnessMeter) {
       return {
         momentaryLufs: -70,
         shortTermLufs: -70,
@@ -920,82 +986,51 @@ export class AudioEngine {
       };
     }
 
+    const reading = this.loudnessMeter.read();
+
+    // Crest factor (sample peak to RMS) from the latest master snapshot
     const timeData = new Float32Array(this.masterAnalyser.fftSize);
     this.masterAnalyser.getFloatTimeDomainData(timeData);
-
-    // 1. True Peak (with 4x inter-sample peak linear interpolation)
-    let maxAbs = 0;
-    for (let i = 0; i < timeData.length - 1; i++) {
-      const s0 = Math.abs(timeData[i]);
-      const s1 = Math.abs(timeData[i + 1]);
-      if (s0 > maxAbs) maxAbs = s0;
-      // Approximate inter-sample peak
-      const mid = Math.abs(s0 + s1) * 0.55;
-      if (mid > maxAbs) maxAbs = mid;
-    }
-    const truePeakDb = maxAbs > 0.000001 ? 20 * Math.log10(maxAbs) : -90;
-
-    // 2. RMS & Mean Square Energy with K-weighting approximation
+    let peak = 0;
     let sumSquares = 0;
     for (let i = 0; i < timeData.length; i++) {
-      sumSquares += timeData[i] * timeData[i];
+      const v = timeData[i];
+      const abs = Math.abs(v);
+      if (abs > peak) peak = abs;
+      sumSquares += v * v;
     }
-    const meanSquare = sumSquares / timeData.length;
-    const rms = Math.sqrt(meanSquare);
-    const rmsDb = rms > 0.000001 ? 20 * Math.log10(rms) : -90;
-
-    // K-weighting power offset for speech & perceptual loudness (~ -0.691 dB offset)
-    const momentaryLufs = meanSquare > 0.0000001 ? -0.691 + 10 * Math.log10(meanSquare) : -90;
-
-    // Track history for short-term (3 seconds ~ 30 frames) and integrated
-    this.loudnessHistory.push(momentaryLufs);
-    if (this.loudnessHistory.length > 200) {
-      this.loudnessHistory.shift();
-    }
-
-    const shortTermWindow = this.loudnessHistory.slice(-30);
-    const shortTermLufs = shortTermWindow.length > 0 
-      ? shortTermWindow.reduce((a, b) => a + b, 0) / shortTermWindow.length 
-      : momentaryLufs;
-
-    // Integrated LUFS with gating (ignoring silence below -70 LUFS)
-    const validGated = this.loudnessHistory.filter((l) => l > -60);
-    const integratedLufs = validGated.length > 0
-      ? validGated.reduce((a, b) => a + b, 0) / validGated.length
-      : momentaryLufs;
-
-    const crestFactorDb = Math.max(0, truePeakDb - rmsDb);
+    const rms = Math.sqrt(sumSquares / timeData.length);
+    const crestFactorDb = rms > 0.000001 && peak > 0 ? 20 * Math.log10(peak / rms) : 0;
 
     return {
-      momentaryLufs: Math.max(-90, Math.min(3, momentaryLufs)),
-      shortTermLufs: Math.max(-90, Math.min(3, shortTermLufs)),
-      integratedLufs: Math.max(-90, Math.min(3, integratedLufs)),
-      truePeakDb: Math.max(-90, Math.min(6, truePeakDb)),
-      crestFactorDb: Math.min(30, crestFactorDb),
-      loudnessRangeLu: Math.max(0, shortTermLufs - integratedLufs + 6),
+      momentaryLufs: Math.max(-90, Math.min(3, reading.momentaryLufs)),
+      shortTermLufs: Math.max(-90, Math.min(3, reading.shortTermLufs)),
+      integratedLufs: Math.max(-90, Math.min(3, reading.integratedLufs)),
+      truePeakDb: Math.max(-90, Math.min(6, reading.shortTermTruePeakDb)),
+      crestFactorDb: Math.max(0, Math.min(30, crestFactorDb)),
+      loudnessRangeLu: reading.loudnessRangeLu,
     };
   }
 
   public resetLoudness(): void {
-    this.loudnessHistory = [];
+    this.loudnessMeter?.reset();
   }
 
   public calculateTrackLoudness(trackId: string): { momentaryLufs: number; truePeakDb: number } {
     const nodes = this.tracks.get(trackId);
-    if (!nodes) return { momentaryLufs: -90, truePeakDb: -90 };
+    const meter = this.trackMeters.get(trackId);
+    if (!nodes || !meter) return { momentaryLufs: -90, truePeakDb: -90 };
 
-    const timeData = new Float32Array(1024);
+    const momentaryLufs = meter.read().momentaryLufs;
+
+    // Sample peak over the analyser window (per-track true peak would be too costly on the main thread)
+    const timeData = new Float32Array(nodes.analyserNode.fftSize);
     nodes.analyserNode.getFloatTimeDomainData(timeData as unknown as Float32Array<ArrayBuffer>);
-
     let maxAbs = 0;
-    let sumSq = 0;
     for (let i = 0; i < timeData.length; i++) {
       const s = Math.abs(timeData[i]);
       if (s > maxAbs) maxAbs = s;
-      sumSq += s * s;
     }
-    const meanSq = sumSq / timeData.length;
-    const momentaryLufs = meanSq > 0.0000001 ? -0.691 + 10 * Math.log10(meanSq) : -90;
     const truePeakDb = maxAbs > 0.000001 ? 20 * Math.log10(maxAbs) : -90;
 
     return {
@@ -1063,11 +1098,11 @@ export class AudioEngine {
       sumMid2 += mid * mid;
       sumSide2 += side * side;
 
-      // Lissajous projection: rotated 45 degrees
-      // X = (L - R) / sqrt(2)  [Side]
+      // Goniometer projection rotated 45 degrees (standard orientation: +L upper-left, +R upper-right)
+      // X = (R - L) / sqrt(2)  [-Side]
       // Y = (L + R) / sqrt(2)  [Mid]
       lissajousPoints.push({
-        x: side,
+        x: -side,
         y: mid,
       });
     }
@@ -1122,26 +1157,40 @@ export class AudioEngine {
       const triggerRing = (triggerTrackId ? this.trackRingBuffers.get(triggerTrackId) : null) || ring;
       const tBuf = triggerRing.buffer;
       const searchBack = Math.min(RING_SIZE - targetSamples - 256, Math.max(targetSamples * 3, 16000));
-      const startSearch = (triggerRing.writeIndex - targetSamples - 128 + RING_SIZE) % RING_SIZE;
+      const endSearch = (triggerRing.writeIndex - targetSamples - 128 + RING_SIZE) % RING_SIZE;
       const hysteresis = 0.012; // Schmitt-trigger hysteresis to eliminate edge hunting/jitter
 
-      for (let s = 0; s < searchBack; s++) {
-        const idx1 = (startSearch - s + RING_SIZE) % RING_SIZE;
-        const idx0 = (idx1 - 1 + RING_SIZE) % RING_SIZE;
-        const s0 = tBuf[idx0];
-        const s1 = tBuf[idx1];
-
+      // Stateful Schmitt trigger scanned forward in time: arm on the far side of the
+      // hysteresis band, fire on the level crossing. Keeps the most recent edge that still
+      // leaves a full window of samples after it. (A two-sample comparison would demand a
+      // jump of 2x hysteresis per sample and never fire on low-frequency material.)
+      let armed = false;
+      let foundEdge = false;
+      for (let s = searchBack; s >= 0; s--) {
+        const idx = (endSearch - s + RING_SIZE) % RING_SIZE;
+        const v = tBuf[idx];
         if (triggerEdge === 'rising') {
-          if (s0 <= (triggerLevel - hysteresis) && s1 >= (triggerLevel + hysteresis)) {
-            triggerIndex = idx1;
-            break;
+          if (v <= triggerLevel - hysteresis) armed = true;
+          else if (armed && v >= triggerLevel) {
+            triggerIndex = idx;
+            foundEdge = true;
+            armed = false;
           }
         } else {
-          if (s0 >= (triggerLevel + hysteresis) && s1 <= (triggerLevel - hysteresis)) {
-            triggerIndex = idx1;
-            break;
+          if (v >= triggerLevel + hysteresis) armed = true;
+          else if (armed && v <= triggerLevel) {
+            triggerIndex = idx;
+            foundEdge = true;
+            armed = false;
           }
         }
+      }
+
+      // Rings of tracks registered at different times have different write positions:
+      // translate the edge into "samples before now" and map it onto this track's ring
+      if (foundEdge && triggerRing !== ring) {
+        const samplesBack = (triggerRing.writeIndex - triggerIndex + RING_SIZE) % RING_SIZE;
+        triggerIndex = (ring.writeIndex - samplesBack + RING_SIZE) % RING_SIZE;
       }
     }
 
@@ -1266,7 +1315,7 @@ export class AudioEngine {
     const RING_SIZE = ring.buffer.length;
     let peakPos = 0.001;
     let peakNeg = -0.001;
-    const inspectSamples = Math.min(RING_SIZE, 9600); // ~200ms at 48kHz
+    const inspectSamples = Math.min(RING_SIZE, Math.round(this.getSampleRate() * 0.2)); // ~200ms
     const startIdx = (ring.writeIndex - inspectSamples + RING_SIZE) % RING_SIZE;
 
     for (let i = 0; i < inspectSamples; i++) {

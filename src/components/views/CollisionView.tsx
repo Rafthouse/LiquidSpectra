@@ -28,6 +28,15 @@ interface CollisionViewProps {
   onUpdateTrack: (track: AudioTrack) => void;
 }
 
+// Stable order: pinned first, then frequent, then by peak severity
+function sortRegistry(registry: Map<string, PersistentCollision>): PersistentCollision[] {
+  return Array.from(registry.values()).sort((a, b) => {
+    if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+    if (a.isFrequent !== b.isFrequent) return a.isFrequent ? -1 : 1;
+    return b.peakSeverity - a.peakSeverity;
+  });
+}
+
 export const CollisionView: React.FC<CollisionViewProps> = ({ tracks, settings, onUpdateTrack }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const animFrameRef = useRef<number | null>(null);
@@ -96,14 +105,7 @@ export const CollisionView: React.FC<CollisionViewProps> = ({ tracks, settings, 
         }
       });
 
-      // Generate stable sorted list
-      const list = Array.from(registry.values()).sort((a, b) => {
-        if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
-        if (a.isFrequent !== b.isFrequent) return a.isFrequent ? -1 : 1;
-        return b.peakSeverity - a.peakSeverity;
-      });
-
-      setPersistentList(list);
+      setPersistentList(sortRegistry(registry));
     }, 100);
 
     return () => clearInterval(interval);
@@ -255,7 +257,7 @@ export const CollisionView: React.FC<CollisionViewProps> = ({ tracks, settings, 
       });
 
       // ── Draw Smooth Multitrack Curves ──
-      const fftSize = 2048;
+      const fftSize = audioEngine.getAnalyserFftSize();
       const binCount = fftSize / 2;
       const sampleRate = audioEngine.getSampleRate();
       const binHz = sampleRate / fftSize;
@@ -312,7 +314,7 @@ export const CollisionView: React.FC<CollisionViewProps> = ({ tracks, settings, 
     const entry = registry.get(key);
     if (entry) {
       entry.isPinned = !entry.isPinned;
-      setPersistentList(Array.from(registry.values()));
+      setPersistentList(sortRegistry(registry));
     }
   };
 

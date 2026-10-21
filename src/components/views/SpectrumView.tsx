@@ -12,7 +12,7 @@
  */
 
 import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
-import { AudioTrack, AnalyzerSettings, FrequencyScale } from '../../types/audio';
+import { AudioTrack, AnalyzerSettings, FrequencyScale, DisplayRange, DISPLAY_RANGE_PRESETS, CollisionEvent } from '../../types/audio';
 import { audioEngine } from '../../audio/AudioEngine';
 import { MasterMeterStrip } from '../common/MasterMeterStrip';
 import {
@@ -85,6 +85,46 @@ function generatePianoKeys(): PianoKey[] {
 
 const PIANO_KEYS = generatePianoKeys();
 
+const SMOOTHING_FRACTION: Record<string, number> = {
+  '1/48': 48,
+  '1/24': 24,
+  '1/12': 12,
+  '1/6': 6,
+  '1/3': 3,
+  '1/1': 1,
+};
+
+/**
+ * 1/N-octave smoothing: each bin becomes the power average of the bins within
+ * ±1/(2N) octave around it. Uses a prefix sum so the cost is O(bins) per frame.
+ */
+function smoothSpectrum(
+  bins: Float32Array,
+  mode: string | undefined,
+  scratch: { current: { prefix: Float64Array; out: Float32Array } }
+): Float32Array {
+  const fraction = mode ? SMOOTHING_FRACTION[mode] : undefined;
+  if (!fraction) return bins;
+
+  const n = bins.length;
+  if (scratch.current.out.length !== n) {
+    scratch.current = { prefix: new Float64Array(n + 1), out: new Float32Array(n) };
+  }
+  const { prefix, out } = scratch.current;
+  prefix[0] = 0;
+  for (let b = 0; b < n; b++) prefix[b + 1] = prefix[b] + Math.pow(10, bins[b] / 10);
+
+  const halfBand = Math.pow(2, 1 / (2 * fraction));
+  out[0] = bins[0];
+  for (let b = 1; b < n; b++) {
+    const lo = Math.max(1, Math.floor(b / halfBand));
+    const hi = Math.min(n - 1, Math.ceil(b * halfBand));
+    const power = (prefix[hi + 1] - prefix[lo]) / (hi - lo + 1);
+    out[b] = power > 1e-12 ? 10 * Math.log10(power) : -120;
+  }
+  return out;
+}
+
 export interface DetectedResonantPeak {
   trackId: string;
   trackName: string;
@@ -122,6 +162,12 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
   const octaveDecayedRef = useRef<Map<string, Float32Array>>(new Map());
   const octavePeakRef = useRef<Map<string, Float32Array>>(new Map());
 
+  // Scratch buffers for fractional-octave smoothing
+  const smoothBufRef = useRef<{ prefix: Float64Array; out: Float32Array }>({
+    prefix: new Float64Array(0),
+    out: new Float32Array(0),
+  });
+
   // Resonant Peaks found by Spectrum Grab
   const resonantPeaksRef = useRef<DetectedResonantPeak[]>([]);
   const [pinnedMeasurementMarker, setPinnedMeasurementMarker] = useState<DetectedResonantPeak | null>(null);
@@ -151,7 +197,9 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
 
   // Top Side-Drawer for Frequency Collisions (Throttled polling at 5Hz to avoid any toolbar jitter)
   const [isSideDrawerOpen, setIsSideDrawerOpen] = useState<boolean>(false);
-  const [detectedCollisionsList, setDetectedCollisionsList] = useState<any[]>([]);
+  const [detectedCollisionsList, setDetectedCollisionsList] = useState<CollisionEvent[]>([]);
+  // Latest 5 Hz collision result shared with the canvas loop (no per-frame re-detection)
+  const collisionsRef = useRef<CollisionEvent[]>([]);
 
   // Test Tone Quick Verification
   const [activeTestTone, setActiveTestTone] = useState<string | null>(null);
@@ -237,6 +285,11 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
         }
         return mid;
       }
+      if (scale === 'mel') {
+        const m = (f: number) => 2595 * Math.log10(1 + f / 700);
+        const targetM = m(minF) + normX * (m(maxF) - m(minF));
+        return 700 * (Math.pow(10, targetM / 2595) - 1);
+      }
       const minLog = Math.log10(minF);
       const maxLog = Math.log10(maxF);
       return Math.pow(10, minLog + normX * (maxLog - minLog));
@@ -296,8 +349,10 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
       const { tracks: curTracks, settings: curSettings } = renderConfigRef.current;
       if (curTracks.length >= 2) {
         const collisions = audioEngine.detectCollisions(curTracks, curSettings.collisionThreshold || 0.45);
+        collisionsRef.current = collisions;
         setDetectedCollisionsList(collisions);
       } else {
+        collisionsRef.current = [];
         setDetectedCollisionsList([]);
       }
     }, 200);
@@ -507,6 +562,7 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
 
         // ── 4. RENDER VISUALIZATION: PEAK-ACCURATE CONTINUOUS SPECTRUM ──
         if (curStyle === 'curve') {
+          const display = smoothSpectrum(decayed, curSettings.smoothing, smoothBufRef);
           // Pixel-Accurate Peak Sampling:
           // Eliminates artificial smearing and reproduces razor-sharp harmonics and punchy bass
           const stepPx = 2; // Sample every 2 pixels across canvas width
@@ -530,10 +586,10 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
               const b0 = Math.floor(exactB);
               const t = exactB - b0;
 
-              const y_1 = decayed[Math.max(1, b0 - 1)];
-              const y0 = decayed[b0];
-              const y1 = decayed[Math.min(binCount - 1, b0 + 1)];
-              const y2 = decayed[Math.min(binCount - 1, b0 + 2)];
+              const y_1 = display[Math.max(1, b0 - 1)];
+              const y0 = display[b0];
+              const y1 = display[Math.min(binCount - 1, b0 + 1)];
+              const y2 = display[Math.min(binCount - 1, b0 + 2)];
 
               // Catmull-Rom cubic interpolation
               const a0 = -0.5 * y_1 + 1.5 * y0 - 1.5 * y1 + 0.5 * y2;
@@ -555,7 +611,7 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
               let maxBinVal = -120;
               let maxHoldVal = -120;
               for (let b = startBin; b <= endBin; b++) {
-                if (decayed[b] > maxBinVal) maxBinVal = decayed[b];
+                if (display[b] > maxBinVal) maxBinVal = display[b];
                 if (peakBins[b] > maxHoldVal) maxHoldVal = peakBins[b];
               }
               valDb = maxBinVal;
@@ -781,7 +837,7 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
 
       // ── 6. IN-SPECTRUM MASKING BEAM OVERLAY ──
       if (curOverlay && curTracks.length >= 2) {
-        const collisions = audioEngine.detectCollisions(curTracks, curSettings.collisionThreshold || 0.45);
+        const collisions = collisionsRef.current;
         collisions.forEach((col) => {
           if (col.maskingSeverity > 0.28) {
             const xCenter = freqToX(col.frequencyHz, width, scale);
@@ -991,17 +1047,10 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
   };
 
   // Preset Display Range changes
-  const handleSetDisplayRange = (range: '30dB' | '60dB' | '90dB' | '120dB') => {
+  const handleSetDisplayRange = (range: DisplayRange) => {
     if (!onUpdateSettings) return;
-    if (range === '30dB') {
-      onUpdateSettings({ ...settings, displayRange: range, minDb: -24, maxDb: 6 });
-    } else if (range === '60dB') {
-      onUpdateSettings({ ...settings, displayRange: range, minDb: -54, maxDb: 6 });
-    } else if (range === '90dB') {
-      onUpdateSettings({ ...settings, displayRange: range, minDb: -84, maxDb: 6 });
-    } else if (range === '120dB') {
-      onUpdateSettings({ ...settings, displayRange: range, minDb: -108, maxDb: 12 });
-    }
+    const { minDb, maxDb } = DISPLAY_RANGE_PRESETS[range];
+    onUpdateSettings({ ...settings, displayRange: range, minDb, maxDb, rangeDb: maxDb - minDb });
   };
 
   return (
@@ -1300,7 +1349,7 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
               ) : (
                 detectedCollisionsList.map((c, i) => (
                   <div
-                    key={c.key || i}
+                    key={`${c.trackAId}__${c.trackBId}__${c.criticalBand}`}
                     className="p-3 rounded-xl bg-slate-900/80 border border-amber-500/30 flex flex-col gap-2 shadow-sm"
                   >
                     <div className="flex items-center justify-between gap-2">

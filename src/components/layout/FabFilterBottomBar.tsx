@@ -10,6 +10,8 @@ import {
   SmoothingMode,
   SpectralTilt,
   AudioTrack,
+  DisplayRange,
+  DISPLAY_RANGE_PRESETS,
 } from '../../types/audio';
 import {
   Activity,
@@ -77,15 +79,12 @@ export const FabFilterBottomBar: React.FC<FabFilterBottomBarProps> = ({
     setActivePopover((prev) => (prev === name ? null : name));
   };
 
+  // Exclusive solo; the engine silences non-solo tracks, so user mute states stay untouched
   const handleToggleSolo = (track: AudioTrack) => {
     const newSolo = !track.isSolo;
     tracks.forEach((t) => {
-      const isTarget = t.id === track.id;
-      onUpdateTrack({
-        ...t,
-        isSolo: isTarget ? newSolo : false,
-        isMuted: newSolo ? !isTarget : false,
-      });
+      const isSolo = t.id === track.id ? newSolo : false;
+      if (t.isSolo !== isSolo) onUpdateTrack({ ...t, isSolo });
     });
   };
 
@@ -274,18 +273,13 @@ export const FabFilterBottomBar: React.FC<FabFilterBottomBarProps> = ({
           </div>
 
           <div className="grid grid-cols-2 gap-1.5 font-mono text-xs">
-            {[
-              { id: '30dB', min: -30, max: 0 },
-              { id: '60dB', min: -60, max: 0 },
-              { id: '90dB', min: -90, max: 0 },
-              { id: '120dB', min: -120, max: 0 },
-            ].map((r) => (
+            {(Object.keys(DISPLAY_RANGE_PRESETS) as DisplayRange[]).map((id) => ({ id, min: DISPLAY_RANGE_PRESETS[id].minDb, max: DISPLAY_RANGE_PRESETS[id].maxDb })).map((r) => (
               <button
                 key={r.id}
                 onClick={() => {
                   onUpdateSettings({
                     ...settings,
-                    displayRange: r.id as '30dB' | '60dB' | '90dB' | '120dB',
+                    displayRange: r.id,
                     minDb: r.min,
                     maxDb: r.max,
                     rangeDb: Math.abs(r.min - r.max),

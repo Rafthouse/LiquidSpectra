@@ -77,6 +77,8 @@ export const StereoView: React.FC<StereoViewProps> = ({ tracks }) => {
     sideDb: -30.0,
   });
   const [trackMetricsList, setTrackMetricsList] = useState<TrackStereoState[]>([]);
+  // The canvas loop is created once, so it must read telemetry through a ref (not the stale state)
+  const telemetryRef = useRef(telemetry);
 
   // Ballistics for smooth needle animation on canvas
   const smoothedCorrRef = useRef<number>(1.0);
@@ -145,11 +147,12 @@ export const StereoView: React.FC<StereoViewProps> = ({ tracks }) => {
         });
 
         if (!isHidden && (!soloTrackId || isSolo)) {
+          // Ø flips the polarity of one channel: correlation changes sign and Mid/Side swap
           totalCorr += isPhaseInverted ? -m.correlation : m.correlation;
-          totalWidth += m.widthPercent;
+          totalWidth += isPhaseInverted && m.widthPercent > 0 ? Math.min(200, 10000 / m.widthPercent) : m.widthPercent;
           totalBalance += m.balance;
-          totalMid += m.midLevelDb;
-          totalSide += m.sideLevelDb;
+          totalMid += isPhaseInverted ? m.sideLevelDb : m.midLevelDb;
+          totalSide += isPhaseInverted ? m.midLevelDb : m.sideLevelDb;
           count++;
         }
       });
@@ -157,13 +160,15 @@ export const StereoView: React.FC<StereoViewProps> = ({ tracks }) => {
       setTrackMetricsList(metricsList);
 
       if (count > 0) {
-        setTelemetry({
+        const next = {
           correlation: totalCorr / count,
           width: totalWidth / count,
           balance: totalBalance / count,
           midDb: totalMid / count,
           sideDb: totalSide / count,
-        });
+        };
+        telemetryRef.current = next;
+        setTelemetry(next);
       }
     }, 100);
 
@@ -357,7 +362,7 @@ export const StereoView: React.FC<StereoViewProps> = ({ tracks }) => {
       ctx.stroke();
 
       // Ballistics physics for smooth analog needle motion
-      const targetCorr = telemetry.correlation;
+      const targetCorr = telemetryRef.current.correlation;
       const springK = 0.12;
       const damping = 0.82;
       const delta = targetCorr - smoothedCorrRef.current;
@@ -424,8 +429,9 @@ export const StereoView: React.FC<StereoViewProps> = ({ tracks }) => {
         const color = curColors.get(track.id) || track.color;
         const inverted = curInverts.get(track.id) || false;
 
+        // Inverting one channel's polarity swaps Mid and Side: (x, y) -> (-y, -x)
         const pts = inverted
-          ? m.lissajousPoints.map((p) => ({ x: -p.x, y: p.y }))
+          ? m.lissajousPoints.map((p) => ({ x: -p.y, y: -p.x }))
           : m.lissajousPoints;
 
         if (pts.length < 2) return;

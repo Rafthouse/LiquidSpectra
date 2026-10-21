@@ -182,19 +182,17 @@ export default function App() {
     return () => mediaQuery.removeEventListener('change', handler);
   }, []);
 
-  // Initialize Audio Engine and Register Initial Tracks
+  // Bumped once the AudioContext exists so the track sync below runs against a live engine
+  const [engineReady, setEngineReady] = useState<boolean>(false);
+
+  // Initialize Audio Engine (may stay suspended until the first user gesture)
   useEffect(() => {
-    const initEngine = async () => {
-      try {
-        await audioEngine.initAudio();
-        tracks.forEach((track) => {
-          audioEngine.registerTrack(track, settings.fftSize);
-        });
-      } catch {
+    audioEngine
+      .initAudio()
+      .then(() => setEngineReady(true))
+      .catch(() => {
         // Engine awaits user gesture
-      }
-    };
-    initEngine();
+      });
   }, []);
 
   // Sync FFT size updates to AudioEngine
@@ -202,9 +200,25 @@ export default function App() {
     audioEngine.setFftSize(settings.fftSize);
   }, [settings.fftSize]);
 
+  // Keep the engine's track graph in step with React state: register new tracks,
+  // drop removed ones and push volume / pan / mute / solo to the gain stages
+  useEffect(() => {
+    if (!engineReady) return;
+    const anySolo = tracks.some((t) => t.isSolo);
+    const ids = new Set(tracks.map((t) => t.id));
+    audioEngine.getTrackIds().forEach((id) => {
+      if (!ids.has(id)) audioEngine.unregisterTrack(id);
+    });
+    tracks.forEach((track) => {
+      if (!audioEngine.hasTrack(track.id)) audioEngine.registerTrack(track, settings.fftSize);
+      audioEngine.updateTrackParameters(track, anySolo);
+    });
+  }, [tracks, engineReady]);
+
   // Handle Playback Toggle
   const handleTogglePlayback = async () => {
     await audioEngine.initAudio();
+    setEngineReady(true);
     const playing = audioEngine.togglePlayback();
     setIsPlaying(playing);
   };
@@ -230,12 +244,17 @@ export default function App() {
   const handleToggleFullscreen = () => {
     if (!document.fullscreenElement) {
       document.documentElement.requestFullscreen().catch(() => {});
-      setIsFullscreen(true);
     } else {
       document.exitFullscreen().catch(() => {});
-      setIsFullscreen(false);
     }
   };
+
+  // Track the real fullscreen state (Esc / browser UI exits bypass the toggle above)
+  useEffect(() => {
+    const handler = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener('fullscreenchange', handler);
+    return () => document.removeEventListener('fullscreenchange', handler);
+  }, []);
 
   const handleUpdateTrack = (updatedTrack: AudioTrack) => {
     setTracks((prev) => prev.map((t) => (t.id === updatedTrack.id ? updatedTrack : t)));

@@ -127,3 +127,13 @@ export interface DSPTestResult {
   message: string;
   benchmarkScore?: string;
 }
+
+export type DisplayRange = '30dB' | '60dB' | '90dB' | '120dB';
+
+// Single source of truth for the dB display range presets (toolbar and bottom bar)
+export const DISPLAY_RANGE_PRESETS: Record<DisplayRange, { minDb: number; maxDb: number }> = {
+  '30dB': { minDb: -30, maxDb: 0 },
+  '60dB': { minDb: -60, maxDb: 0 },
+  '90dB': { minDb: -90, maxDb: 0 },
+  '120dB': { minDb: -120, maxDb: 0 },
+};
