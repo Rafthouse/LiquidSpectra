@@ -3,18 +3,37 @@
 
 namespace LiquidAudio {
 
-LiquidSpectraAudioProcessorEditor::LiquidSpectraAudioProcessorEditor(LiquidSpectraAudioProcessor& p)
-    : AudioProcessorEditor(&p), audioProcessor(p)
+namespace
 {
-    // FabFilter standard plugin window proportions
-    setSize(980, 560);
-    setResizable(true, true);
-    setResizeLimits(740, 440, 2560, 1440);
+    constexpr float MIN_FREQ = 20.0f;
+    constexpr float MAX_FREQ = 20000.0f;
+    constexpr float MIN_DB = -90.0f;
+    constexpr float MAX_DB = 6.0f;
+    constexpr float METER_MIN_DB = -60.0f;
+    constexpr int TIMER_HZ = 60;
+    constexpr int PEAK_HOLD_FRAMES = TIMER_HZ * 3 / 2; // 1.5 s
 
-    displayMagnitudes.resize(SpectralAnalyzerDSP::NUM_BARK_BANDS, -100.0f);
+    juce::Font uiFont (float height, bool bold = false)
+    {
+        return juce::Font (juce::FontOptions (height, bold ? juce::Font::bold : juce::Font::plain));
+    }
 
-    // High refresh rate 60 FPS UI timer (16.6ms)
-    startTimerHz(60);
+    juce::String formatLufs (float value)
+    {
+        return value <= LoudnessMeterEBU::SILENCE_DB + 0.5f ? juce::String ("-inf") : juce::String (value, 1);
+    }
+}
+
+LiquidSpectraAudioProcessorEditor::LiquidSpectraAudioProcessorEditor (LiquidSpectraAudioProcessor& p)
+    : AudioProcessorEditor (&p), audioProcessor (p)
+{
+    spectrumDb.fill (SpectralAnalyzerDSP::FLOOR_DB);
+
+    setResizable (true, true);
+    setResizeLimits (740, 440, 2560, 1440);
+    setSize (980, 560);
+
+    startTimerHz (TIMER_HZ);
 }
 
 LiquidSpectraAudioProcessorEditor::~LiquidSpectraAudioProcessorEditor()
@@ -24,313 +43,307 @@ LiquidSpectraAudioProcessorEditor::~LiquidSpectraAudioProcessorEditor()
 
 void LiquidSpectraAudioProcessorEditor::resized()
 {
-    // Reactive layout automatically adapts bounds
+    auto area = getLocalBounds();
+    headerArea = area.removeFromTop (44);
+    meterArea = area.removeFromRight (72);
+    spectrumArea = area.toFloat().reduced (4.0f);
+
+    clipBox = { meterArea.getX() + 12, meterArea.getY() + 8, meterArea.getWidth() - 24, 16 };
+    loudnessArea = headerArea.withTrimmedLeft (250).withTrimmedRight (190);
 }
 
 void LiquidSpectraAudioProcessorEditor::timerCallback()
 {
-    // 1. Fetch live DSP magnitudes from audio processor
-    const auto& liveMagnitudes = audioProcessor.getSpectralAnalyzer().getLatestBarkMagnitudes();
-    for (size_t i = 0; i < liveMagnitudes.size() && i < displayMagnitudes.size(); ++i)
-    {
-        // Smooth exponential attack / release
-        const float target = liveMagnitudes[i];
-        if (target > displayMagnitudes[i])
-            displayMagnitudes[i] += (target - displayMagnitudes[i]) * 0.45f;
-        else
-            displayMagnitudes[i] += (target - displayMagnitudes[i]) * 0.12f;
-    }
+    // 1. Spectrum of this instance (consistent copy via the analyser's sequence lock)
+    audioProcessor.getSpectralAnalyzer().readSpectrum (spectrumDb);
 
-    // 2. Fetch live Loudness / True-Peak metrics
-    auto& loudness = audioProcessor.getLoudnessMeter();
-    const float currentPeak = loudness.getTruePeakDb();
-    
-    // Smooth meter dynamics
-    smoothedPeakL = juce::jmax(smoothedPeakL - 1.2f, currentPeak);
-    smoothedPeakR = juce::jmax(smoothedPeakR - 1.2f, currentPeak);
-    smoothedRmsL = juce::jmax(smoothedRmsL - 0.8f, loudness.getIntegratedLoudnessLUFS());
-    smoothedRmsR = juce::jmax(smoothedRmsR - 0.8f, loudness.getIntegratedLoudnessLUFS());
+    // 2. Every instance on the shared bus, then cross-track masking for this one
+    numBusTracks = LiquidSpectraAudioProcessor::getSharedBus().snapshot (busTracks);
+    collisions = CollisionDetector::analyzeCollisions (busTracks.data(), numBusTracks);
 
-    if (smoothedPeakL > 0.0f)
-        clipLatched = true;
+    // 3. Per-channel true-peak meters with peak hold and clip latch
+    const auto& loudness = audioProcessor.getLoudnessMeter();
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        const float target = loudness.getRecentTruePeakDb (ch);
+        auto& level = meterDb[(size_t) ch];
+        level = target > level ? target : juce::jmax (target, level - 1.2f); // instant attack, ~72 dB/s release
 
-    if (smoothedPeakL > peakHoldDbL)
-    {
-        peakHoldDbL = smoothedPeakL;
-        peakHoldAgeFrames = 0;
-    }
-    else if (++peakHoldAgeFrames > 70)
-    {
-        peakHoldDbL = juce::jmax(-60.0f, peakHoldDbL - 0.4f);
+        auto& hold = peakHoldDb[(size_t) ch];
+        auto& age = peakHoldAgeFrames[(size_t) ch];
+        if (target >= hold)
+        {
+            hold = target;
+            age = 0;
+        }
+        else if (++age > PEAK_HOLD_FRAMES)
+        {
+            hold = juce::jmax (-90.0f, hold - 0.4f);
+        }
+
+        if (target > 0.0f)
+            clipLatched = true;
     }
 
     repaint();
 }
 
-float LiquidSpectraAudioProcessorEditor::freqToX(float freqHz, juce::Rectangle<float> b) const noexcept
+float LiquidSpectraAudioProcessorEditor::freqToX (float freqHz, juce::Rectangle<float> b) const noexcept
 {
-    const float minF = 20.0f;
-    const float maxF = 20000.0f;
-    const float norm = std::log10(juce::jlimit(minF, maxF, freqHz) / minF) / std::log10(maxF / minF);
+    const float norm = std::log10 (juce::jlimit (MIN_FREQ, MAX_FREQ, freqHz) / MIN_FREQ) / std::log10 (MAX_FREQ / MIN_FREQ);
     return b.getX() + norm * b.getWidth();
 }
 
-float LiquidSpectraAudioProcessorEditor::dbToY(float db, juce::Rectangle<float> b) const noexcept
+float LiquidSpectraAudioProcessorEditor::dbToY (float db, juce::Rectangle<float> b) const noexcept
 {
-    const float minDb = -90.0f;
-    const float maxDb = 12.0f;
-    const float norm = (juce::jlimit(minDb, maxDb, db) - minDb) / (maxDb - minDb);
+    const float norm = (juce::jlimit (MIN_DB, MAX_DB, db) - MIN_DB) / (MAX_DB - MIN_DB);
     return b.getBottom() - norm * b.getHeight();
 }
 
-void LiquidSpectraAudioProcessorEditor::paint(juce::Graphics& g)
+void LiquidSpectraAudioProcessorEditor::paint (juce::Graphics& g)
 {
-    // 1. Deep OLED/Obsidian FabFilter background
-    g.fillAll(juce::Colour(0xff090b10));
+    g.fillAll (juce::Colour (0xff090b10));
 
-    auto totalArea = getLocalBounds();
-    auto headerArea = totalArea.removeFromTop(44);
-    auto meterArea = totalArea.removeFromRight(64);
-    auto spectrumArea = totalArea.toFloat().reduced(4.0f);
-
-    paintHeader(g, headerArea);
-    paintFrequencyGrid(g, spectrumArea);
-    paintCollisionRegions(g, spectrumArea);
-    paintSpectrumCurves(g, spectrumArea);
-    paintMasterOutputMeter(g, meterArea);
+    paintHeader (g, headerArea);
+    paintFrequencyGrid (g, spectrumArea);
+    paintCollisionRegions (g, spectrumArea);
+    paintOtherTracks (g, spectrumArea);
+    paintSpectrumCurve (g, spectrumArea);
+    paintMasterOutputMeter (g, meterArea);
 }
 
-void LiquidSpectraAudioProcessorEditor::paintHeader(juce::Graphics& g, juce::Rectangle<int> bounds)
+void LiquidSpectraAudioProcessorEditor::paintHeader (juce::Graphics& g, juce::Rectangle<int> bounds)
 {
-    g.setColour(juce::Colour(0xff121620));
-    g.fillRect(bounds);
-    g.setColour(juce::Colour(0x20ffffff));
-    g.drawHorizontalLine(bounds.getBottom() - 1, (float)bounds.getX(), (float)bounds.getRight());
+    g.setColour (juce::Colour (0xff121620));
+    g.fillRect (bounds);
+    g.setColour (juce::Colour (0x20ffffff));
+    g.drawHorizontalLine (bounds.getBottom() - 1, (float) bounds.getX(), (float) bounds.getRight());
 
-    // Brand Wordmark
-    g.setFont(juce::Font(15.0f, juce::Font::bold));
-    g.setColour(juce::Colours::white);
-    g.drawText("LiquidSpectra", bounds.getX() + 16, bounds.getY() + 8, 110, 26, juce::Justification::left);
+    g.setFont (uiFont (15.0f, true));
+    g.setColour (juce::Colours::white);
+    g.drawText ("LiquidSpectra", bounds.getX() + 16, bounds.getY() + 8, 120, 26, juce::Justification::centredLeft);
 
-    g.setFont(juce::Font(11.0f, juce::Font::bold));
-    g.setColour(juce::Colour(0xff06b6d4));
-    g.drawText("PRO VST3 / AU", bounds.getX() + 130, bounds.getY() + 9, 100, 26, juce::Justification::left);
+    g.setFont (uiFont (11.0f, true));
+    g.setColour (juce::Colour (0xff06b6d4));
+    g.drawText ("ANALYZER", bounds.getX() + 136, bounds.getY() + 9, 100, 26, juce::Justification::centredLeft);
 
-    // Track Identifier Pill
-    g.setColour(audioProcessor.getTrackColour().withAlpha(0.2f));
-    juce::Rectangle<float> trackPill((float)(bounds.getRight() - 180), (float)(bounds.getY() + 10), 160.0f, 24.0f);
-    g.fillRoundedRectangle(trackPill, 12.0f);
-    g.setColour(audioProcessor.getTrackColour());
-    g.drawRoundedRectangle(trackPill, 12.0f, 1.0f);
-    g.drawText(audioProcessor.getTrackName(), trackPill.toNearestInt(), juce::Justification::centred);
+    // EBU R128 readouts (double-click to reset)
+    const auto& loudness = audioProcessor.getLoudnessMeter();
+    const std::array<std::pair<const char*, juce::String>, 5> readouts { {
+        { "M", formatLufs (loudness.getMomentaryLUFS()) },
+        { "S", formatLufs (loudness.getShortTermLUFS()) },
+        { "I", formatLufs (loudness.getIntegratedLUFS()) },
+        { "LRA", juce::String (loudness.getLoudnessRangeLU(), 1) },
+        { "TP", formatLufs (loudness.getTruePeakDb()) },
+    } };
+
+    auto cells = loudnessArea.reduced (0, 8);
+    const int cellWidth = cells.getWidth() / (int) readouts.size();
+    for (const auto& [label, value] : readouts)
+    {
+        auto cell = cells.removeFromLeft (cellWidth);
+        g.setFont (uiFont (9.0f, true));
+        g.setColour (juce::Colour (0x80ffffff));
+        g.drawText (label, cell.removeFromLeft (26), juce::Justification::centredRight);
+        g.setFont (uiFont (12.0f, true));
+        g.setColour (juce::Colours::white);
+        g.drawText (value, cell.withTrimmedLeft (4), juce::Justification::centredLeft);
+    }
+
+    // Track identity pill (name / colour come from the DAW when the host reports them)
+    const auto colour = audioProcessor.getTrackColour();
+    juce::Rectangle<float> trackPill ((float) (bounds.getRight() - 180), (float) (bounds.getY() + 10), 160.0f, 24.0f);
+    g.setColour (colour.withAlpha (0.2f));
+    g.fillRoundedRectangle (trackPill, 12.0f);
+    g.setColour (colour);
+    g.drawRoundedRectangle (trackPill, 12.0f, 1.0f);
+    g.setFont (uiFont (11.0f, true));
+    g.drawText (audioProcessor.getTrackName(), trackPill.toNearestInt(), juce::Justification::centred);
 }
 
-void LiquidSpectraAudioProcessorEditor::paintFrequencyGrid(juce::Graphics& g, juce::Rectangle<float> b)
+void LiquidSpectraAudioProcessorEditor::paintFrequencyGrid (juce::Graphics& g, juce::Rectangle<float> b)
 {
     static const float freqs[] = { 30, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 16000 };
     static const char* labels[] = { "30", "50", "100", "250", "500", "1k", "2k", "5k", "10k", "16k" };
 
-    g.setFont(juce::Font(10.0f, juce::Font::plain));
-    for (size_t i = 0; i < 10; ++i)
+    g.setFont (uiFont (10.0f));
+    for (size_t i = 0; i < std::size (freqs); ++i)
     {
-        const float x = freqToX(freqs[i], b);
-        g.setColour(juce::Colour(0x15ffffff));
-        g.drawVerticalLine((int)x, b.getY(), b.getBottom());
+        const float x = freqToX (freqs[i], b);
+        g.setColour (juce::Colour (0x15ffffff));
+        g.drawVerticalLine ((int) x, b.getY(), b.getBottom());
 
-        g.setColour(juce::Colour(0x60ffffff));
-        g.drawText(labels[i], (int)x - 18, (int)b.getBottom() - 16, 36, 14, juce::Justification::centred);
+        g.setColour (juce::Colour (0x60ffffff));
+        g.drawText (labels[i], (int) x - 18, (int) b.getBottom() - 16, 36, 14, juce::Justification::centred);
     }
 
-    // Horizontal dB lines (-60, -36, -24, -12, 0 dB)
-    static const float dBs[] = { -60.0f, -36.0f, -24.0f, -12.0f, 0.0f };
+    static const float dBs[] = { -72.0f, -60.0f, -48.0f, -36.0f, -24.0f, -12.0f, 0.0f };
     for (float db : dBs)
     {
-        const float y = dbToY(db, b);
-        g.setColour(db == 0.0f ? juce::Colour(0x35ef4444) : juce::Colour(0x12ffffff));
-        g.drawHorizontalLine((int)y, b.getX(), b.getRight());
+        const float y = dbToY (db, b);
+        g.setColour (db == 0.0f ? juce::Colour (0x35ef4444) : juce::Colour (0x12ffffff));
+        g.drawHorizontalLine ((int) y, b.getX(), b.getRight());
 
-        g.setColour(juce::Colour(0x50ffffff));
-        g.drawText(juce::String((int)db) + " dB", (int)b.getX() + 6, (int)y - 12, 45, 12, juce::Justification::left);
+        g.setColour (juce::Colour (0x50ffffff));
+        g.drawText (juce::String ((int) db) + " dB", (int) b.getX() + 6, (int) y - 12, 45, 12, juce::Justification::left);
     }
 }
 
-void LiquidSpectraAudioProcessorEditor::paintCollisionRegions(juce::Graphics& g, juce::Rectangle<float> b)
+void LiquidSpectraAudioProcessorEditor::paintCollisionRegions (juce::Graphics& g, juce::Rectangle<float> b)
 {
-    // Check shared bus for other tracks colliding in the low/mid range (kick vs bass)
-    auto otherTracks = LiquidSpectraAudioProcessor::getSharedBus().snapshotActiveTracks();
-    if (otherTracks.size() <= 1) return;
+    const int myId = audioProcessor.getInstanceId();
 
-    for (const auto& track : otherTracks)
+    for (const auto& c : collisions)
     {
-        if (track.instanceId == audioProcessor.getInstanceId()) continue;
+        if (c.trackAId != myId && c.trackBId != myId)
+            continue;
 
-        // Bark band 3-6 (150Hz - 400Hz) clash check
-        for (int band = 2; band <= 6; ++band)
+        const int band = c.criticalBandIndex;
+        const float x1 = freqToX (barkBandEdgesHz[(size_t) band], b);
+        const float x2 = freqToX (barkBandEdgesHz[(size_t) band + 1], b);
+
+        g.setColour (juce::Colour (0xffff0055).withAlpha (0.08f + 0.22f * c.maskingSeverity));
+        g.fillRect (juce::Rectangle<float> (x1, b.getY(), juce::jmax (2.0f, x2 - x1), b.getHeight()));
+
+        const auto& other = c.trackAId == myId ? c.trackBName : c.trackAName;
+        g.setColour (juce::Colour (0xffff0055));
+        g.setFont (uiFont (9.0f, true));
+        g.drawFittedText ("CLASH " + juce::String (juce::roundToInt (c.maskingSeverity * 100.0f)) + "%\n" + juce::String (other),
+                          juce::Rectangle<float> (x1, b.getY() + 8, juce::jmax (40.0f, x2 - x1), 26.0f).toNearestInt(),
+                          juce::Justification::centredTop, 2);
+    }
+}
+
+void LiquidSpectraAudioProcessorEditor::paintOtherTracks (juce::Graphics& g, juce::Rectangle<float> b)
+{
+    const auto& centres = barkBandCentresHz();
+    const int myId = audioProcessor.getInstanceId();
+
+    for (int t = 0; t < numBusTracks; ++t)
+    {
+        const auto& track = busTracks[(size_t) t];
+        if (track.instanceId == myId)
+            continue;
+
+        juce::Path curve;
+        for (int band = 0; band < BARK_BANDS_COUNT; ++band)
         {
-            float myAmp = displayMagnitudes[band];
-            float theirAmp = track.barkMagnitudes[band];
-
-            if (myAmp > -30.0f && theirAmp > -30.0f && std::abs(myAmp - theirAmp) < 6.0f)
-            {
-                // Draw pulsating collision hotspot
-                float fCenter = 100.0f * (float)std::pow(1.5f, band);
-                float x = freqToX(fCenter, b);
-                juce::Rectangle<float> warningZone(x - 22.0f, b.getY(), 44.0f, b.getHeight());
-
-                g.setColour(juce::Colour(0x28ff0055));
-                g.fillRect(warningZone);
-
-                g.setColour(juce::Colour(0xffff0055));
-                g.drawText("CLASH", (int)x - 20, (int)b.getY() + 10, 40, 14, juce::Justification::centred);
-            }
+            const juce::Point<float> pt { freqToX (centres[(size_t) band], b), dbToY (track.barkMagnitudes[band], b) };
+            if (band == 0)
+                curve.startNewSubPath (pt);
+            else
+                curve.lineTo (pt);
         }
+
+        g.setColour (juce::Colour (track.colourArgb).withAlpha (0.7f));
+        g.strokePath (curve, juce::PathStrokeType (1.4f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
     }
 }
 
-void LiquidSpectraAudioProcessorEditor::paintSpectrumCurves(juce::Graphics& g, juce::Rectangle<float> b)
+void LiquidSpectraAudioProcessorEditor::paintSpectrumCurve (juce::Graphics& g, juce::Rectangle<float> b)
 {
+    // One point per ~2 px: maximum of the FFT bins that fall under each step (keeps harmonics crisp)
+    const double sampleRate = audioProcessor.getSpectralAnalyzer().getSampleRate();
+    const float binHz = (float) sampleRate / (float) SpectralAnalyzerDSP::FFT_SIZE;
+    const int steps = juce::jmax (2, (int) (b.getWidth() / 2.0f));
+    const float logSpan = std::log10 (MAX_FREQ / MIN_FREQ);
+
     juce::Path curve;
-    const auto& barkEdges = SpectralAnalyzerDSP::getBarkCenterFrequencies();
-    const size_t numPoints = std::min(barkEdges.size(), displayMagnitudes.size());
-
-    if (numPoints < 2) return;
-
-    const float firstX = freqToX(barkEdges[0], b);
-    const float firstY = dbToY(displayMagnitudes[0], b);
-    curve.startNewSubPath(firstX, firstY);
-
-    for (size_t i = 1; i < numPoints; ++i)
+    for (int s = 0; s <= steps; ++s)
     {
-        const float x = freqToX(barkEdges[i], b);
-        const float y = dbToY(displayMagnitudes[i], b);
-        curve.lineTo(x, y);
+        const float f1 = MIN_FREQ * std::pow (10.0f, logSpan * (float) s / (float) steps);
+        const float f2 = MIN_FREQ * std::pow (10.0f, logSpan * (float) (s + 1) / (float) steps);
+        const int bin1 = juce::jlimit (1, SpectralAnalyzerDSP::NUM_BINS - 1, (int) std::floor (f1 / binHz));
+        const int bin2 = juce::jlimit (bin1, SpectralAnalyzerDSP::NUM_BINS - 1, (int) std::floor (f2 / binHz));
+
+        float level = SpectralAnalyzerDSP::FLOOR_DB;
+        for (int bin = bin1; bin <= bin2; ++bin)
+            level = juce::jmax (level, spectrumDb[(size_t) bin]);
+
+        const juce::Point<float> pt { freqToX (f1, b), dbToY (level, b) };
+        if (s == 0)
+            curve.startNewSubPath (pt);
+        else
+            curve.lineTo (pt);
     }
 
-    // 1. Fill below curve with liquid glowing gradient
-    juce::Path fillPath = curve;
-    fillPath.lineTo(b.getRight(), b.getBottom());
-    fillPath.lineTo(b.getX(), b.getBottom());
+    juce::Path fillPath (curve);
+    fillPath.lineTo (b.getRight(), b.getBottom());
+    fillPath.lineTo (b.getX(), b.getBottom());
     fillPath.closeSubPath();
 
-    juce::ColourGradient grad(
-        juce::Colour(0x5006b6d4), b.getCentreX(), b.getY(),
-        juce::Colour(0x0206b6d4), b.getCentreX(), b.getBottom(), false);
-    g.setGradientFill(grad);
-    g.fillPath(fillPath);
+    const auto colour = audioProcessor.getTrackColour();
+    g.setGradientFill (juce::ColourGradient (colour.withAlpha (0.32f), b.getCentreX(), b.getY(),
+                                             colour.withAlpha (0.01f), b.getCentreX(), b.getBottom(), false));
+    g.fillPath (fillPath);
 
-    // 2. Neon illuminated vector spline stroke
-    g.setColour(juce::Colour(0xff22d3ee));
-    g.strokePath(curve, juce::PathStrokeType(2.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    g.setColour (colour);
+    g.strokePath (curve, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
 }
 
-void LiquidSpectraAudioProcessorEditor::paintMasterOutputMeter(juce::Graphics& g, juce::Rectangle<int> bounds)
+void LiquidSpectraAudioProcessorEditor::paintMasterOutputMeter (juce::Graphics& g, juce::Rectangle<int> bounds)
 {
-    // Dark glass meter strip
-    g.setColour(juce::Colour(0xff0d1017));
-    g.fillRect(bounds);
-    g.setColour(juce::Colour(0x20ffffff));
-    g.drawVerticalLine(bounds.getX(), (float)bounds.getY(), (float)bounds.getBottom());
+    g.setColour (juce::Colour (0xff0d1017));
+    g.fillRect (bounds);
+    g.setColour (juce::Colour (0x20ffffff));
+    g.drawVerticalLine (bounds.getX(), (float) bounds.getY(), (float) bounds.getBottom());
 
-    // Clip Indicator
-    juce::Rectangle<int> clipBox(bounds.getX() + 12, bounds.getY() + 8, bounds.getWidth() - 24, 16);
-    g.setColour(clipLatched ? juce::Colour(0xffff2244) : juce::Colour(0x30331111));
-    g.fillRoundedRectangle(clipBox.toFloat(), 4.0f);
-    g.setColour(clipLatched ? juce::Colours::white : juce::Colour(0x60ffffff));
-    g.setFont(juce::Font(9.0f, juce::Font::bold));
-    g.drawText("CLIP", clipBox, juce::Justification::centred);
+    // Clip indicator (latched on true peak > 0 dBTP, click to reset)
+    g.setColour (clipLatched ? juce::Colour (0xffff2244) : juce::Colour (0x30331111));
+    g.fillRoundedRectangle (clipBox.toFloat(), 4.0f);
+    g.setColour (clipLatched ? juce::Colours::white : juce::Colour (0x60ffffff));
+    g.setFont (uiFont (9.0f, true));
+    g.drawText ("CLIP", clipBox, juce::Justification::centred);
 
-    // Stereo Meter Bars (L / R)
-    auto barArea = bounds.reduced(14, 30);
-    barArea.removeFromTop(10);
-    barArea.removeFromBottom(40);
-
+    auto barArea = bounds.withTrimmedTop (clipBox.getBottom() - bounds.getY() + 10).reduced (14, 0).withTrimmedBottom (30);
     const int barWidth = (barArea.getWidth() - 4) / 2;
-    juce::Rectangle<int> barL(barArea.getX(), barArea.getY(), barWidth, barArea.getHeight());
-    juce::Rectangle<int> barR(barArea.getX() + barWidth + 4, barArea.getY(), barWidth, barArea.getHeight());
 
-    // Meter slot background
-    g.setColour(juce::Colour(0xff05070a));
-    g.fillRect(barL);
-    g.fillRect(barR);
-
-    // Compute active height from dB (-60 to 0)
-    auto computeH = [&](float db, int maxH) {
-        float norm = (juce::jlimit(-60.0f, 0.0f, db) + 60.0f) / 60.0f;
-        return (int)(norm * maxH);
+    auto heightFor = [] (float db, int maxH)
+    {
+        const float norm = (juce::jlimit (METER_MIN_DB, 0.0f, db) - METER_MIN_DB) / -METER_MIN_DB;
+        return (int) (norm * (float) maxH);
     };
 
-    int hL = computeH(smoothedPeakL, barL.getHeight());
-    int hR = computeH(smoothedPeakR, barR.getHeight());
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        const juce::Rectangle<int> bar (barArea.getX() + ch * (barWidth + 4), barArea.getY(), barWidth, barArea.getHeight());
+        g.setColour (juce::Colour (0xff05070a));
+        g.fillRect (bar);
 
-    juce::ColourGradient meterGrad(
-        juce::Colour(0xffff3355), 0, (float)barL.getY(),
-        juce::Colour(0xff10b981), 0, (float)barL.getBottom(), false);
+        const int h = heightFor (meterDb[(size_t) ch], bar.getHeight());
+        g.setGradientFill (juce::ColourGradient (juce::Colour (0xffff3355), 0.0f, (float) bar.getY(),
+                                                 juce::Colour (0xff10b981), 0.0f, (float) bar.getBottom(), false));
+        g.fillRect (bar.getX(), bar.getBottom() - h, bar.getWidth(), h);
 
-    g.setGradientFill(meterGrad);
-    g.fillRect(barL.getX(), barL.getBottom() - hL, barL.getWidth(), hL);
-    g.fillRect(barR.getX(), barR.getBottom() - hR, barR.getWidth(), hR);
+        g.setColour (juce::Colours::white);
+        g.drawHorizontalLine (bar.getBottom() - heightFor (peakHoldDb[(size_t) ch], bar.getHeight()),
+                              (float) bar.getX(), (float) bar.getRight());
+    }
 
-    // Peak hold ticks
-    int holdYL = barL.getBottom() - computeH(peakHoldDbL, barL.getHeight());
-    int holdYR = barR.getBottom() - computeH(peakHoldDbR, barR.getHeight());
-    g.setColour(juce::Colours::white);
-    g.drawHorizontalLine(holdYL, (float)barL.getX(), (float)barL.getRight());
-    g.drawHorizontalLine(holdYR, (float)barR.getX(), (float)barR.getRight());
-
-    // Master Volume Drag Handle & Percentage Label
-    juce::Rectangle<int> faderBox(bounds.getX() + 6, bounds.getBottom() - 34, bounds.getWidth() - 12, 26);
-    g.setColour(juce::Colour(0xff182030));
-    g.fillRoundedRectangle(faderBox.toFloat(), 6.0f);
-    g.setColour(juce::Colour(0xff38bdf8));
-    g.drawRoundedRectangle(faderBox.toFloat(), 6.0f, 1.0f);
-    g.setFont(juce::Font(10.0f, juce::Font::bold));
-    g.drawText(juce::String((int)(masterGainLevel * 100.0f)) + "%", faderBox, juce::Justification::centred);
+    g.setFont (uiFont (10.0f, true));
+    g.setColour (juce::Colour (0xff38bdf8));
+    const float maxHold = juce::jmax (peakHoldDb[0], peakHoldDb[1]);
+    g.drawText (maxHold <= -89.5f ? juce::String ("-inf") : juce::String (maxHold, 1) + " dBTP",
+                bounds.getX(), bounds.getBottom() - 26, bounds.getWidth(), 20, juce::Justification::centred);
 }
 
-void LiquidSpectraAudioProcessorEditor::mouseDown(const juce::MouseEvent& e)
+void LiquidSpectraAudioProcessorEditor::mouseDown (const juce::MouseEvent& e)
 {
-    // Clip badge click resets clip
-    juce::Rectangle<int> clipBox(getWidth() - 52, 8, 40, 16);
-    if (clipBox.contains(e.getPosition()))
+    if (clipBox.contains (e.getPosition()))
     {
         clipLatched = false;
-        peakHoldDbL = -60.0f;
-        peakHoldDbR = -60.0f;
-        repaint();
-        return;
-    }
-
-    if (e.x > getWidth() - 64)
-    {
-        isDraggingMasterFader = true;
-    }
-}
-
-void LiquidSpectraAudioProcessorEditor::mouseDrag(const juce::MouseEvent& e)
-{
-    if (isDraggingMasterFader)
-    {
-        const float delta = (float)-e.getDistanceFromDragStartY() / 150.0f;
-        masterGainLevel = juce::jlimit(0.0f, 1.25f, masterGainLevel + delta * 0.05f);
+        peakHoldDb = { -90.0f, -90.0f };
         repaint();
     }
 }
 
-void LiquidSpectraAudioProcessorEditor::mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel)
+void LiquidSpectraAudioProcessorEditor::mouseDoubleClick (const juce::MouseEvent& e)
 {
-    if (e.x > getWidth() - 64)
+    if (loudnessArea.contains (e.getPosition()))
     {
-        masterGainLevel = juce::jlimit(0.0f, 1.25f, masterGainLevel + wheel.deltaY * 0.05f);
-        repaint();
-    }
-}
-
-void LiquidSpectraAudioProcessorEditor::mouseDoubleClick(const juce::MouseEvent& e)
-{
-    if (e.x > getWidth() - 64)
-    {
-        masterGainLevel = 1.0f; // Reset to unity (100% / 0 dB)
-        repaint();
+        audioProcessor.getLoudnessMeter().requestReset();
+        clipLatched = false;
+        peakHoldDb = { -90.0f, -90.0f };
     }
 }
 

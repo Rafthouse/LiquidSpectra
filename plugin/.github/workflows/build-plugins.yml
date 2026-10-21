@@ -15,32 +15,22 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install CMake & Ninja
-        uses: lukka/get-cmake@latest
+      - name: Configure CMake (Release x64)
+        run: cmake -B build -A x64
 
-      - name: Configure CMake for Windows (Release x64)
-        run: |
-          cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build VST3 and Standalone (.exe)
-        run: |
-          cmake --build build --config Release --parallel
+      - name: Build VST3, Standalone and tests
+        run: cmake --build build --config Release --parallel
 
       - name: Run DSP Unit Tests
-        run: |
-          ctest --test-dir build -C Release --output-on-failure
+        run: ctest --test-dir build -C Release --output-on-failure
 
-      - name: Stage Windows Binaries
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist-windows
-          Get-ChildItem -Path build -Recurse -Include *.vst3,*.exe | Copy-Item -Destination dist-windows -Recurse
-
-      - name: Upload Windows VST3 Binary Artifact
+      - name: Upload Windows Binaries
         uses: actions/upload-artifact@v4
         with:
-          name: LiquidSpectra-Windows-VST3-x64
-          path: dist-windows/
+          name: LiquidSpectra-Windows-x64
+          path: |
+            build/LiquidSpectra_artefacts/Release/VST3/
+            build/LiquidSpectra_artefacts/Release/Standalone/
           retention-days: 14
 
   build-macos:
@@ -50,34 +40,24 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install CMake & Ninja
-        uses: lukka/get-cmake@latest
-
-      - name: Configure CMake for macOS (Universal Apple Silicon + Intel)
+      - name: Configure CMake (Universal)
         run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=Release \
+          cmake -B build -G Xcode \
             -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="11.0"
 
-      - name: Build VST3, AU (.component), and Standalone
-        run: |
-          cmake --build build --config Release --parallel
+      - name: Build VST3, AU, Standalone and tests
+        run: cmake --build build --config Release --parallel
 
       - name: Run DSP Unit Tests
-        run: |
-          ctest --test-dir build -C Release --output-on-failure
+        run: ctest --test-dir build -C Release --output-on-failure
 
-      - name: Stage macOS Plug-in Bundles
-        run: |
-          mkdir -p dist-macos
-          find build -name "*.vst3" -exec cp -R {} dist-macos/ \; 2>/dev/null || true
-          find build -name "*.component" -exec cp -R {} dist-macos/ \; 2>/dev/null || true
-          find build -name "*.app" -exec cp -R {} dist-macos/ \; 2>/dev/null || true
-
-      - name: Upload macOS VST3 & AU Artifact
+      - name: Upload macOS Bundles
         uses: actions/upload-artifact@v4
         with:
-          name: LiquidSpectra-macOS-Universal-VST3-AU
-          path: dist-macos/
+          name: LiquidSpectra-macOS-Universal
+          path: |
+            build/LiquidSpectra_artefacts/Release/VST3/
+            build/LiquidSpectra_artefacts/Release/AU/
+            build/LiquidSpectra_artefacts/Release/Standalone/
           retention-days: 14

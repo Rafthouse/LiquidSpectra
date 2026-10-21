@@ -3,80 +3,172 @@
 
 namespace LiquidAudio {
 
-MultiInstanceBus LiquidSpectraAudioProcessor::sharedBus;
+MultiInstanceBus& LiquidSpectraAudioProcessor::getSharedBus() noexcept
+{
+    // Function-local static: constructed on first use, no static-initialisation-order issues
+    static MultiInstanceBus bus;
+    return bus;
+}
 
 LiquidSpectraAudioProcessor::LiquidSpectraAudioProcessor()
-    : AudioProcessor(BusesProperties()
-                     .withInput  ("Input",     juce::AudioChannelSet::stereo(), true)
-                     .withOutput ("Output",    juce::AudioChannelSet::stereo(), true)
-                     .withInput  ("Sidechain", juce::AudioChannelSet::stereo(), false))
+    : AudioProcessor (BusesProperties()
+                      .withInput  ("Input",     juce::AudioChannelSet::stereo(), true)
+                      .withOutput ("Output",    juce::AudioChannelSet::stereo(), true)
+                      .withInput  ("Sidechain", juce::AudioChannelSet::stereo(), false))
 {
-    instanceId = sharedBus.registerInstance(this);
+    instanceId = getSharedBus().registerInstance (this);
+    if (instanceId >= 0)
+        trackName = "Track " + juce::String (instanceId + 1);
+    publishTrackInfo();
 }
 
 LiquidSpectraAudioProcessor::~LiquidSpectraAudioProcessor()
 {
-    sharedBus.unregisterInstance(instanceId);
+    getSharedBus().unregisterInstance (instanceId);
 }
 
-bool LiquidSpectraAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
+bool LiquidSpectraAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
-    // Must have matching main I/O
-    if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::mono()
-     && layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
+    const auto mainOut = layouts.getMainOutputChannelSet();
+    if (mainOut != juce::AudioChannelSet::mono() && mainOut != juce::AudioChannelSet::stereo())
         return false;
 
-    if (layouts.getMainInputChannelSet() != layouts.getMainOutputChannelSet())
+    if (layouts.getMainInputChannelSet() != mainOut)
         return false;
 
-    // Sidechain input must be mono or stereo if enabled
-    auto sidechain = layouts.getChannelSet(true, 1);
-    if (!sidechain.isDisabled() && sidechain != juce::AudioChannelSet::mono() && sidechain != juce::AudioChannelSet::stereo())
-        return false;
+    if (layouts.inputBuses.size() > 1)
+    {
+        const auto sidechain = layouts.getChannelSet (true, 1);
+        if (! sidechain.isDisabled() && sidechain != juce::AudioChannelSet::mono() && sidechain != juce::AudioChannelSet::stereo())
+            return false;
+    }
 
     return true;
 }
 
-void LiquidSpectraAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
+void LiquidSpectraAudioProcessor::prepareToPlay (double sampleRate, int)
 {
-    spectralAnalyzer.prepare(sampleRate, samplesPerBlock);
-    loudnessMeter.prepare(sampleRate, samplesPerBlock);
+    spectralAnalyzer.prepare (sampleRate);
+    loudnessMeter.prepare (sampleRate);
 }
 
 void LiquidSpectraAudioProcessor::releaseResources()
 {
     spectralAnalyzer.reset();
-    loudnessMeter.reset();
 }
 
-void LiquidSpectraAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+void LiquidSpectraAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
-    const int totalNumInputChannels  = getTotalNumInputChannels();
-    const int numSamples = buffer.getNumSamples();
 
-    if (numSamples == 0 || totalNumInputChannels == 0)
-        return;
+    // Analyse the main input only; the sidechain lives in the same buffer and must not leak in
+    const auto mainInput = getBusBuffer (buffer, true, 0);
+    const int numChannels = mainInput.getNumChannels();
+    const int numSamples = mainInput.getNumSamples();
 
-    // 1. Send audio block to local spectral analyzer (FFT + Bark mapping)
-    spectralAnalyzer.pushAudioBlock(buffer);
+    if (numSamples > 0 && numChannels > 0)
+    {
+        const auto* const* channels = mainInput.getArrayOfReadPointers();
+        spectralAnalyzer.pushSamples (channels, numChannels, numSamples);
+        loudnessMeter.processBlock (channels, numChannels, numSamples);
 
-    // 2. Measure ITU-R BS.1770 LUFS and True Peak
-    loudnessMeter.processBlock(buffer);
+        const auto& bark = spectralAnalyzer.getLatestBarkMagnitudes();
+        getSharedBus().publishSpectrum (instanceId, bark.data(), (int) bark.size());
+    }
 
-    // 3. Broadcast spectral frame to shared multi-track bus for cross-track collision detection
-    const auto& currentMagnitudes = spectralAnalyzer.getLatestBarkMagnitudes();
-    sharedBus.publishSpectrum(instanceId, trackName, trackColour, currentMagnitudes.data(), (int)currentMagnitudes.size());
-
-    // Pass-through audio unaltered (pure analyzer)
+    // Pure analyser: main audio passes through untouched; clear any extra output channels
+    for (int ch = getTotalNumInputChannels(); ch < getTotalNumOutputChannels(); ++ch)
+        buffer.clear (ch, 0, buffer.getNumSamples());
 }
 
-void LiquidSpectraAudioProcessor::getStateInformation(juce::MemoryBlock&) {}
-void LiquidSpectraAudioProcessor::setStateInformation(const void*, int) {}
+void LiquidSpectraAudioProcessor::setTrackName (const juce::String& name)
+{
+    {
+        const juce::SpinLock::ScopedLockType lock (trackInfoLock);
+        trackName = name;
+    }
+    publishTrackInfo();
+}
+
+juce::String LiquidSpectraAudioProcessor::getTrackName() const
+{
+    const juce::SpinLock::ScopedLockType lock (trackInfoLock);
+    return trackName;
+}
+
+void LiquidSpectraAudioProcessor::setTrackColour (juce::Colour c)
+{
+    {
+        const juce::SpinLock::ScopedLockType lock (trackInfoLock);
+        trackColour = c;
+    }
+    publishTrackInfo();
+}
+
+juce::Colour LiquidSpectraAudioProcessor::getTrackColour() const
+{
+    const juce::SpinLock::ScopedLockType lock (trackInfoLock);
+    return trackColour;
+}
+
+void LiquidSpectraAudioProcessor::updateTrackProperties (const TrackProperties& properties)
+{
+    {
+        const juce::SpinLock::ScopedLockType lock (trackInfoLock);
+        if (properties.name.has_value() && properties.name->isNotEmpty())
+            trackName = *properties.name;
+        if (properties.colourARGB.has_value())
+            trackColour = juce::Colour (*properties.colourARGB);
+    }
+    publishTrackInfo();
+}
+
+void LiquidSpectraAudioProcessor::publishTrackInfo()
+{
+    // Several threads may set the name/colour; the lock keeps the bus slot single-writer
+    const juce::SpinLock::ScopedLockType lock (trackInfoLock);
+    getSharedBus().setTrackInfo (instanceId, trackName.toRawUTF8(), trackColour.getARGB());
+}
+
+void LiquidSpectraAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    juce::ValueTree state ("LiquidSpectraState");
+    state.setProperty ("trackName", getTrackName(), nullptr);
+    state.setProperty ("trackColour", (juce::int64) getTrackColour().getARGB(), nullptr);
+
+    if (auto xml = state.createXml())
+        copyXmlToBinary (*xml, destData);
+}
+
+void LiquidSpectraAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    const auto xml = getXmlFromBinary (data, sizeInBytes);
+    if (xml == nullptr)
+        return;
+
+    const auto state = juce::ValueTree::fromXml (*xml);
+    if (! state.hasType ("LiquidSpectraState"))
+        return;
+
+    {
+        const juce::SpinLock::ScopedLockType lock (trackInfoLock);
+        if (state.hasProperty ("trackName"))
+            trackName = state["trackName"].toString();
+        if (state.hasProperty ("trackColour"))
+            trackColour = juce::Colour ((juce::uint32) (juce::int64) state["trackColour"]);
+    }
+    publishTrackInfo();
+}
 
 juce::AudioProcessorEditor* LiquidSpectraAudioProcessor::createEditor()
 {
-    return new LiquidSpectraAudioProcessorEditor(*this);
+    return new LiquidSpectraAudioProcessorEditor (*this);
 }
 
 } // namespace LiquidAudio
+
+// Factory used by the JUCE plugin wrappers
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new LiquidAudio::LiquidSpectraAudioProcessor();
+}

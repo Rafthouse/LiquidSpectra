@@ -2,86 +2,118 @@
 
 #include <array>
 #include <atomic>
-#include <vector>
-#include <cstring>
-#include <juce_core/juce_core.h>
+#include <cstdint>
+
+#include "BarkScale.h"
+#include "SeqLock.h"
 
 namespace LiquidAudio {
 
 constexpr int MAX_SIMULTANEOUS_TRACKS = 32;
-constexpr int BARK_BANDS_COUNT = 24;
+constexpr int TRACK_NAME_CAPACITY = 32;
 
-struct TrackSpectrumFrame {
+/** Plain, copyable view of one instance's published state (built on the reader side). */
+struct TrackSnapshot
+{
     int instanceId { -1 };
-    char name[32] { 0 };
-    uint32_t colourArgb { 0 };
-    float barkMagnitudes[BARK_BANDS_COUNT] { 0 };
-    std::atomic<uint64_t> sequenceNumber { 0 };
+    char name[TRACK_NAME_CAPACITY] {};
+    std::uint32_t colourArgb { 0 };
+    float barkMagnitudes[BARK_BANDS_COUNT] {};
 };
 
+/**
+ * Process-wide bus through which plugin instances in the same host process share their
+ * critical-band spectra.
+ *  - publishSpectrum(): audio thread, lock-free and allocation-free (single writer per slot)
+ *  - setTrackInfo():    message thread (single writer per slot, guarded by the caller)
+ *  - snapshot():        any non-audio thread, retries instead of blocking writers
+ * Note: hosts that sandbox plugins in separate processes will not share one bus.
+ */
 class MultiInstanceBus
 {
 public:
     MultiInstanceBus() = default;
 
-    int registerInstance(void* processorPtr)
+    int registerInstance (void* owner) noexcept
     {
         for (int i = 0; i < MAX_SIMULTANEOUS_TRACKS; ++i)
         {
             void* expected = nullptr;
-            if (activeSlots[i].compare_exchange_strong(expected, processorPtr))
+            if (slots[(size_t) i].owner.compare_exchange_strong (expected, owner, std::memory_order_acq_rel))
             {
-                frames[i].instanceId = i;
+                std::array<float, BARK_BANDS_COUNT> silence;
+                silence.fill (-120.0f);
+                slots[(size_t) i].bark.write (silence.data(), silence.size());
                 return i;
             }
         }
-        return -1;
+        return -1; // bus full: this instance analyses locally but is not shared
     }
 
-    void unregisterInstance(int instanceId)
+    void unregisterInstance (int slotIndex) noexcept
     {
-        if (instanceId >= 0 && instanceId < MAX_SIMULTANEOUS_TRACKS)
-        {
-            activeSlots[instanceId].store(nullptr);
-            frames[instanceId].instanceId = -1;
-        }
+        if (isValid (slotIndex))
+            slots[(size_t) slotIndex].owner.store (nullptr, std::memory_order_release);
     }
 
-    void publishSpectrum(int slotIndex, const juce::String& trackName, juce::Colour col, const float* barkData, int numBands)
+    void setTrackInfo (int slotIndex, const char* utf8Name, std::uint32_t colourArgb) noexcept
     {
-        if (slotIndex < 0 || slotIndex >= MAX_SIMULTANEOUS_TRACKS) return;
+        if (! isValid (slotIndex))
+            return;
 
-        auto& frame = frames[slotIndex];
-        std::strncpy(frame.name, trackName.toRawUTF8(), sizeof(frame.name) - 1);
-        frame.colourArgb = col.getARGB();
+        // Bounded copy, always NUL-terminated (long names are truncated)
+        char buffer[TRACK_NAME_CAPACITY] {};
+        if (utf8Name != nullptr)
+            for (int i = 0; i < TRACK_NAME_CAPACITY - 1 && utf8Name[i] != '\0'; ++i)
+                buffer[i] = utf8Name[i];
 
-        const int copyCount = std::min(numBands, BARK_BANDS_COUNT);
-        for (int b = 0; b < copyCount; ++b)
-        {
-            frame.barkMagnitudes[b] = barkData[b];
-        }
-
-        frame.sequenceNumber.fetch_add(1, std::memory_order_release);
+        auto& slot = slots[(size_t) slotIndex];
+        slot.name.write (buffer, TRACK_NAME_CAPACITY);
+        slot.colourArgb.store (colourArgb, std::memory_order_relaxed);
     }
 
-    std::vector<TrackSpectrumFrame> snapshotActiveTracks() const
+    void publishSpectrum (int slotIndex, const float* barkData, int numBands) noexcept
     {
-        std::vector<TrackSpectrumFrame> result;
-        result.reserve(MAX_SIMULTANEOUS_TRACKS);
+        if (! isValid (slotIndex) || barkData == nullptr)
+            return;
 
+        slots[(size_t) slotIndex].bark.write (barkData, (std::size_t) (numBands < BARK_BANDS_COUNT ? numBands : BARK_BANDS_COUNT));
+    }
+
+    /** Fills `out` with every registered instance; returns how many were written. Never call from the audio thread. */
+    int snapshot (std::array<TrackSnapshot, MAX_SIMULTANEOUS_TRACKS>& out) const noexcept
+    {
+        int count = 0;
         for (int i = 0; i < MAX_SIMULTANEOUS_TRACKS; ++i)
         {
-            if (activeSlots[i].load() != nullptr && frames[i].instanceId >= 0)
-            {
-                result.push_back(frames[i]);
-            }
+            const auto& slot = slots[(size_t) i];
+            if (slot.owner.load (std::memory_order_acquire) == nullptr)
+                continue;
+
+            auto& dst = out[(size_t) count];
+            dst.instanceId = i;
+            if (! slot.bark.read (dst.barkMagnitudes, BARK_BANDS_COUNT))
+                continue;
+            slot.name.read (dst.name, TRACK_NAME_CAPACITY);
+            dst.name[TRACK_NAME_CAPACITY - 1] = '\0';
+            dst.colourArgb = slot.colourArgb.load (std::memory_order_relaxed);
+            ++count;
         }
-        return result;
+        return count;
     }
 
 private:
-    std::array<std::atomic<void*>, MAX_SIMULTANEOUS_TRACKS> activeSlots { nullptr };
-    std::array<TrackSpectrumFrame, MAX_SIMULTANEOUS_TRACKS> frames;
+    static bool isValid (int slotIndex) noexcept { return slotIndex >= 0 && slotIndex < MAX_SIMULTANEOUS_TRACKS; }
+
+    struct Slot
+    {
+        std::atomic<void*> owner { nullptr };
+        std::atomic<std::uint32_t> colourArgb { 0 };
+        SeqLockArray<char, TRACK_NAME_CAPACITY> name;
+        SeqLockArray<float, BARK_BANDS_COUNT> bark;
+    };
+
+    std::array<Slot, MAX_SIMULTANEOUS_TRACKS> slots;
 };
 
 } // namespace LiquidAudio
