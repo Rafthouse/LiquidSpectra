@@ -6,9 +6,10 @@
 
 import { AudioTrack, CollisionEvent, LoudnessMetrics, StereoMetrics } from '../types/audio';
 import { BS1770Meter } from './loudness';
+import { ScopeRing, ScopeTrace, findTriggerCrossing, acquireTrace } from './scope';
 
-// Seconds of audio kept per track for the oscilloscope / phase tools
-const RING_SECONDS = 10;
+// Seconds of audio kept per track: the 10 s timebase plus room to search for a trigger
+const RING_SECONDS = 13;
 
 interface TrackNodes {
   sourceNode: AudioNode | null;
@@ -22,20 +23,34 @@ interface TrackNodes {
   processorNode: ScriptProcessorNode;
 }
 
-export interface OscilloscopeChannelData {
-  trackId: string;
-  minValues: Float32Array;
-  maxValues: Float32Array;
-  centerValues: Float32Array;
-  peakVoltage: number;
-  rmsVoltage: number;
+// Smaller blocks = fresher scope data (~47 updates/s at 48 kHz) for smooth persistence
+const TRACK_TAP_BLOCK = 1024;
+
+export interface ScopeFrameRequest {
+  trackIds: string[];
+  timebaseMs: number;
+  columns: number;
+  mode: 'trigger' | 'roll';
+  triggerTrackId?: string;
+  triggerLevel?: number;
+  triggerEdge?: 'rising' | 'falling';
+  /** Fraction of the window shown before the trigger point (0..0.9). */
+  preTrigger?: number;
+}
+
+export interface ScopeFrame {
+  traces: Map<string, ScopeTrace>;
+  /** True when a trigger edge was found; false = auto (free-running) acquisition. */
+  triggered: boolean;
+  /** Absolute sample at the left edge of the screen (identical for every channel). */
+  startSample: number;
 }
 
 export class AudioEngine {
   private ctx: AudioContext | null = null;
   private fftSize: number = 4096;
   private tracks: Map<string, TrackNodes> = new Map();
-  private trackRingBuffers: Map<string, { buffer: Float32Array; writeIndex: number }> = new Map();
+  private trackRingBuffers: Map<string, ScopeRing> = new Map();
   private silentGain: GainNode | null = null;
   private masterGain: GainNode | null = null;
   private masterAnalyser: AnalyserNode | null = null;
@@ -173,19 +188,17 @@ export class AudioEngine {
     splitterNode.connect(leftAnalyserNode, 0);
     splitterNode.connect(rightAnalyserNode, 1);
 
-    // Continuous 10-second multi-track ring buffer recorder (sized for the actual sample rate)
-    const RING_SIZE = Math.round(this.ctx.sampleRate * RING_SECONDS);
-    const ring = {
-      buffer: new Float32Array(RING_SIZE),
-      writeIndex: 0,
-    };
+    // Continuous 10-second recorder on the shared absolute sample timeline
+    const sampleRate = this.ctx.sampleRate;
+    const ring = new ScopeRing(RING_SECONDS, sampleRate);
     this.trackRingBuffers.set(track.id, ring);
+    const mono = new Float32Array(TRACK_TAP_BLOCK);
 
     // Per-track K-weighted meter (true peak skipped: it runs on the main thread for every track)
     const trackMeter = new BS1770Meter(this.ctx.sampleRate, 2, { truePeak: false });
     this.trackMeters.set(track.id, trackMeter);
 
-    const processorNode = this.ctx.createScriptProcessor(2048, 2, 1);
+    const processorNode = this.ctx.createScriptProcessor(TRACK_TAP_BLOCK, 2, 1);
     processorNode.channelCount = 2;
     processorNode.channelCountMode = 'explicit';
     processorNode.onaudioprocess = (e) => {
@@ -194,13 +207,10 @@ export class AudioEngine {
       trackMeter.process([left, right]);
 
       const len = left.length;
-      const buf = ring.buffer;
-      let wIdx = ring.writeIndex;
-      for (let i = 0; i < len; i++) {
-        buf[wIdx] = 0.5 * (left[i] + right[i]);
-        wIdx = (wIdx + 1) % RING_SIZE;
-      }
-      ring.writeIndex = wIdx;
+      const block = len === mono.length ? mono : new Float32Array(len);
+      for (let i = 0; i < len; i++) block[i] = 0.5 * (left[i] + right[i]);
+      // playbackTime is shared by every processor in the graph, so all tracks land on one timeline
+      ring.write(block, Math.round(e.playbackTime * sampleRate), performance.now());
     };
 
     panNode.connect(processorNode);
@@ -1053,148 +1063,62 @@ export class AudioEngine {
     };
   }
 
-  // --- Premium Oscilloscope Channel Data Extraction (Continuous Multi-Track Ring Buffer) ---
-  public getOscilloscopeChannelData(
-    trackId: string,
-    timebaseMs: number,
-    triggerMode: 'free' | 'trigger' | 'freeze',
-    triggerTrackId?: string,
-    triggerLevel: number = 0.05,
-    triggerEdge: 'rising' | 'falling' = 'rising',
-    phaseOffsetMs: number = 0
-  ): OscilloscopeChannelData | null {
-    const ring = this.trackRingBuffers.get(trackId);
-    if (!ring) return null;
-
-    const RING_SIZE = ring.buffer.length;
+  // --- Oscilloscope acquisition (shared timeline, sub-sample trigger) ---
+  public getScopeFrame(req: ScopeFrameRequest): ScopeFrame | null {
     const sampleRate = this.getSampleRate();
-    const targetSamples = Math.max(16, Math.min(RING_SIZE - 2048, Math.round((timebaseMs / 1000) * sampleRate)));
+    const rings = req.trackIds
+      .map((id) => [id, this.trackRingBuffers.get(id)] as const)
+      .filter((entry): entry is readonly [string, ScopeRing] => entry[1] !== undefined && entry[1].endSample > 0);
+    if (rings.length === 0) return null;
 
-    // Determine baseline trigger point
-    let triggerIndex = (ring.writeIndex - targetSamples + RING_SIZE) % RING_SIZE;
+    const triggerRing = req.triggerTrackId ? this.trackRingBuffers.get(req.triggerTrackId) : undefined;
+    const capacity = rings[0][1].size;
+    const length = Math.max(8, Math.min(capacity * 0.95, (req.timebaseMs / 1000) * sampleRate));
 
-    if (triggerMode === 'trigger') {
-      const triggerRing = (triggerTrackId ? this.trackRingBuffers.get(triggerTrackId) : null) || ring;
-      const tBuf = triggerRing.buffer;
-      const searchBack = Math.min(RING_SIZE - targetSamples - 256, Math.max(targetSamples * 3, 16000));
-      const endSearch = (triggerRing.writeIndex - targetSamples - 128 + RING_SIZE) % RING_SIZE;
-      const hysteresis = 0.012; // Schmitt-trigger hysteresis to eliminate edge hunting/jitter
+    // Newest instant that every channel (and the trigger source) has already delivered
+    let commonEnd = Math.min(...rings.map(([, r]) => r.endSample));
+    if (triggerRing && triggerRing.endSample > 0) commonEnd = Math.min(commonEnd, triggerRing.endSample);
 
-      // Stateful Schmitt trigger scanned forward in time: arm on the far side of the
-      // hysteresis band, fire on the level crossing. Keeps the most recent edge that still
-      // leaves a full window of samples after it. (A two-sample comparison would demand a
-      // jump of 2x hysteresis per sample and never fire on low-frequency material.)
-      let armed = false;
-      let foundEdge = false;
-      for (let s = searchBack; s >= 0; s--) {
-        const idx = (endSearch - s + RING_SIZE) % RING_SIZE;
-        const v = tBuf[idx];
-        if (triggerEdge === 'rising') {
-          if (v <= triggerLevel - hysteresis) armed = true;
-          else if (armed && v >= triggerLevel) {
-            triggerIndex = idx;
-            foundEdge = true;
-            armed = false;
-          }
-        } else {
-          if (v >= triggerLevel + hysteresis) armed = true;
-          else if (armed && v <= triggerLevel) {
-            triggerIndex = idx;
-            foundEdge = true;
-            armed = false;
-          }
-        }
-      }
+    let start: number | null = null;
+    let triggered = false;
 
-      // Rings of tracks registered at different times have different write positions:
-      // translate the edge into "samples before now" and map it onto this track's ring
-      if (foundEdge && triggerRing !== ring) {
-        const samplesBack = (triggerRing.writeIndex - triggerIndex + RING_SIZE) % RING_SIZE;
-        triggerIndex = (ring.writeIndex - samplesBack + RING_SIZE) % RING_SIZE;
-      }
-    }
-
-    // Apply phase offset
-    const phaseSamples = Math.round((phaseOffsetMs / 1000) * sampleRate);
-    const startIdx = (triggerIndex + phaseSamples + RING_SIZE) % RING_SIZE;
-
-    const DISPLAY_POINTS = 1000;
-    const minValues = new Float32Array(DISPLAY_POINTS);
-    const maxValues = new Float32Array(DISPLAY_POINTS);
-    const centerValues = new Float32Array(DISPLAY_POINTS);
-
-    let peak = 0;
-    let sumSq = 0;
-
-    const samplesPerPoint = targetSamples / DISPLAY_POINTS;
-
-    if (samplesPerPoint >= 1) {
-      for (let p = 0; p < DISPLAY_POINTS; p++) {
-        const segStart = Math.floor(p * samplesPerPoint);
-        const segEnd = Math.max(segStart + 1, Math.floor((p + 1) * samplesPerPoint));
-        let minVal = 1.0;
-        let maxVal = -1.0;
-        let sum = 0;
-
-        for (let s = segStart; s < segEnd; s++) {
-          const bufIdx = (startIdx + s) % RING_SIZE;
-          const val = ring.buffer[bufIdx];
-          if (val < minVal) minVal = val;
-          if (val > maxVal) maxVal = val;
-          sum += val;
-
-          const abs = Math.abs(val);
-          if (abs > peak) peak = abs;
-          sumSq += val * val;
-        }
-
-        minValues[p] = minVal === 1.0 ? 0 : minVal;
-        maxValues[p] = maxVal === -1.0 ? 0 : maxVal;
-        centerValues[p] = sum / (segEnd - segStart);
-      }
-    } else {
-      // Zoomed in (fewer samples than display points, e.g. 1ms - 25ms)
-      // Master-grade 4-point Catmull-Rom cubic spline interpolation for perfectly smooth curves
-      for (let p = 0; p < DISPLAY_POINTS; p++) {
-        const sampleFraction = p * samplesPerPoint;
-        const s0 = Math.floor(sampleFraction);
-        const frac = sampleFraction - s0;
-
-        const p_prev = ring.buffer[(startIdx + s0 - 1 + RING_SIZE) % RING_SIZE];
-        const p0 = ring.buffer[(startIdx + s0) % RING_SIZE];
-        const p1 = ring.buffer[(startIdx + s0 + 1) % RING_SIZE];
-        const p_next = ring.buffer[(startIdx + s0 + 2) % RING_SIZE];
-
-        const t = frac;
-        const t2 = t * t;
-        const t3 = t2 * t;
-        const interp = 0.5 * (
-          (2 * p0) +
-          (-p_prev + p1) * t +
-          (2 * p_prev - 5 * p0 + 4 * p1 - p_next) * t2 +
-          (-p_prev + 3 * p0 - 3 * p1 + p_next) * t3
+    if (req.mode === 'trigger' && triggerRing) {
+      const pre = Math.min(0.9, Math.max(0, req.preTrigger ?? 0.1));
+      const post = length * (1 - pre);
+      // Look for the newest edge first, widening the window only when needed; slow material
+      // may need a long look-back, but most frames resolve within the first few milliseconds
+      const searchEnd = commonEnd - post - 2;
+      const maxSpan = Math.max(0, Math.min(capacity - length - 2, Math.max(length * 3, sampleRate * 0.25)));
+      let crossing: number | null = null;
+      for (let span = Math.min(maxSpan, 2048); crossing === null; span = Math.min(maxSpan, span * 4)) {
+        crossing = findTriggerCrossing(
+          triggerRing,
+          searchEnd - span,
+          searchEnd,
+          req.triggerLevel ?? 0,
+          req.triggerEdge ?? 'rising',
+          0.01
         );
-
-        minValues[p] = interp;
-        maxValues[p] = interp;
-        centerValues[p] = interp;
-
-        const abs = Math.abs(interp);
-        if (abs > peak) peak = abs;
-        sumSq += interp * interp;
+        if (span >= maxSpan) break;
+      }
+      if (crossing !== null) {
+        start = crossing - pre * length;
+        triggered = true;
       }
     }
 
-    const rms = Math.sqrt(sumSq / Math.max(1, targetSamples));
+    if (start === null) {
+      // Roll / auto: glide between audio callbacks so the trace scrolls instead of jumping
+      const newest = rings.reduce((r, [, ring]) => (ring.lastWriteMs > r.lastWriteMs ? ring : r), rings[0][1]);
+      const blockLen = newest.lastBlockLength || TRACK_TAP_BLOCK;
+      const elapsed = ((performance.now() - newest.lastWriteMs) / 1000) * sampleRate;
+      const end = commonEnd - blockLen + Math.min(blockLen, Math.max(0, elapsed));
+      start = end - length;
+    }
 
-    return {
-      trackId,
-      minValues,
-      maxValues,
-      centerValues,
-      peakVoltage: peak,
-      rmsVoltage: rms,
-    };
+    const traces = new Map<string, ScopeTrace>();
+    for (const [id, ring] of rings) traces.set(id, acquireTrace(ring, start, length, Math.max(2, Math.round(req.columns))));
+    return { traces, triggered, startSample: start };
   }
 
   // --- Phase Alignment Coherence Calculation ---
@@ -1206,18 +1130,17 @@ export class AudioEngine {
     const sampleRate = this.getSampleRate();
     const testSamples = 2048;
     const phaseSamples = Math.round((phaseOffsetMs / 1000) * sampleRate);
-    const RING_SIZE = ringA.buffer.length;
 
     let dot = 0;
     let sumA2 = 0;
     let sumB2 = 0;
 
-    const startA = (ringA.writeIndex - testSamples + RING_SIZE) % RING_SIZE;
-    const startB = (ringB.writeIndex - testSamples + phaseSamples + RING_SIZE) % RING_SIZE;
+    // Compare the same absolute instants of both tracks
+    const start = Math.min(ringA.endSample, ringB.endSample - phaseSamples) - testSamples;
 
     for (let i = 0; i < testSamples; i += 2) {
-      const a = ringA.buffer[(startA + i) % RING_SIZE];
-      const b = ringB.buffer[(startB + i) % RING_SIZE];
+      const a = ringA.sample(start + i);
+      const b = ringB.sample(start + i + phaseSamples);
       dot += a * b;
       sumA2 += a * a;
       sumB2 += b * b;
@@ -1232,14 +1155,12 @@ export class AudioEngine {
     const ring = this.trackRingBuffers.get(trackId);
     if (!ring) return { peakPos: 0, peakNeg: 0, maxPeak: 0 };
 
-    const RING_SIZE = ring.buffer.length;
     let peakPos = 0.001;
     let peakNeg = -0.001;
-    const inspectSamples = Math.min(RING_SIZE, Math.round(this.getSampleRate() * 0.2)); // ~200ms
-    const startIdx = (ring.writeIndex - inspectSamples + RING_SIZE) % RING_SIZE;
+    const inspectSamples = Math.min(ring.size, Math.round(this.getSampleRate() * 0.2)); // ~200ms
 
-    for (let i = 0; i < inspectSamples; i++) {
-      const v = ring.buffer[(startIdx + i) % RING_SIZE];
+    for (let s = ring.endSample - inspectSamples; s < ring.endSample; s++) {
+      const v = ring.sample(s);
       if (v > peakPos) peakPos = v;
       if (v < peakNeg) peakNeg = v;
     }
