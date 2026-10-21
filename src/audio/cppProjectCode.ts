@@ -22,6 +22,7 @@ import skiaCpp from '../../plugin/Source/SkiaVectorRenderer.cpp?raw';
 import testsCpp from '../../plugin/Tests/DSPUnitTests.cpp?raw';
 import workflowYml from '../../plugin/.github/workflows/build-plugins.yml?raw';
 import buildGuideMd from '../../plugin/BUILD_GUIDE.md?raw';
+import readmeMd from '../../plugin/README.md?raw';
 
 export interface CppFile {
   name: string;
@@ -62,6 +63,8 @@ export const CPP_PROJECT_FILES: CppFile[] = [
     description: 'EBU Tech 3341/3342 reference tests, spectrum calibration, bus concurrency (runs in Release)' },
   { name: 'build-plugins.yml', path: '.github/workflows/build-plugins.yml', language: 'yaml', content: workflowYml,
     description: 'GitHub Actions: Windows VST3 and macOS Universal VST3/AU builds with tests' },
+  { name: 'README.md', path: 'README.md', language: 'markdown', content: readmeMd,
+    description: 'Project overview and quick build commands' },
   { name: 'BUILD_GUIDE.md', path: 'BUILD_GUIDE.md', language: 'markdown', content: buildGuideMd,
     description: 'Build instructions for Windows and macOS' },
   {

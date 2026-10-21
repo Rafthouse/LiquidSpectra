@@ -15,35 +15,19 @@ import {
 } from '../../types/audio';
 import {
   Activity,
-  Sliders,
-  Volume2,
-  Sparkles,
-  ShieldAlert,
-  ChevronUp,
   ChevronDown,
   RotateCcw,
   SlidersHorizontal,
   X,
-  Layers,
-  Music,
-  BarChart3,
-  GitCommit,
-  Radio,
   Eye,
   EyeOff,
-  Plus,
-  Trash2,
 } from 'lucide-react';
-import { LiquidKnob } from '../common/LiquidKnob';
 
 interface FabFilterBottomBarProps {
   settings: AnalyzerSettings;
   onUpdateSettings: (settings: AnalyzerSettings) => void;
-  masterVolume: number;
-  onChangeMasterVolume: (vol: number) => void;
   tracks: AudioTrack[];
   onUpdateTrack: (track: AudioTrack) => void;
-  onAddTrack: (track: AudioTrack) => void;
   isMicActive: boolean;
   onToggleMic: () => void;
 }
@@ -53,11 +37,8 @@ type ActivePopover = 'analyzer' | 'range' | 'masking' | 'tracks' | 'output' | nu
 export const FabFilterBottomBar: React.FC<FabFilterBottomBarProps> = ({
   settings,
   onUpdateSettings,
-  masterVolume,
-  onChangeMasterVolume,
   tracks,
   onUpdateTrack,
-  onAddTrack,
   isMicActive,
   onToggleMic,
 }) => {

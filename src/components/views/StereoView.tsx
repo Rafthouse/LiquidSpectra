@@ -2,7 +2,7 @@
  * StereoView - Master-Grade Studio Multitrack Goniometer & Vectorscope Suite
  * Crafted with ultra-luxurious Apple Liquid Glass & titanium mastering hardware aesthetics:
  * - Precision laser-etched circular polar reticle with 360° degree markings and concentric dB rings
- * - True analog phosphor CRT beam simulation with persistent decay trails & additive luminous blending
+ * - Glowing phosphor-style beam with additive luminous blending
  * - Dynamic perimeter Phase Correlation Arc (Ruby -1.0 -> Amber 0.0 -> Emerald +1.0) with jewel needle
  * - Instantaneous Center Phase Azimuth Needle with illuminated sapphire pivot
  * - 4 Scope Engines: Analog CRT Lissajous X-Y, Polar Dispersion Radar, Phosphor Cloud, and Living M/S Field
@@ -87,9 +87,6 @@ export const StereoView: React.FC<StereoViewProps> = ({ tracks }) => {
   // Smooth ballistics for dynamic M/S ellipse breathing
   const smoothedMidEnergyRef = useRef<number>(0.5);
   const smoothedSideEnergyRef = useRef<number>(0.3);
-
-  // Persistence canvas for authentic CRT Phosphor decay
-  const persistenceCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Refs for canvas drawing loop to access latest state without re-creating effect
   const scopeStateRef = useRef({
@@ -179,11 +176,6 @@ export const StereoView: React.FC<StereoViewProps> = ({ tracks }) => {
   useEffect(() => {
     let isDestroyed = false;
 
-    // Create offscreen persistence buffer
-    if (!persistenceCanvasRef.current) {
-      persistenceCanvasRef.current = document.createElement('canvas');
-    }
-
     const render = () => {
       if (isDestroyed) return;
       const canvas = canvasRef.current;
@@ -203,13 +195,6 @@ export const StereoView: React.FC<StereoViewProps> = ({ tracks }) => {
         canvas.width = width * dpr;
         canvas.height = height * dpr;
       }
-
-      const pCanvas = persistenceCanvasRef.current!;
-      if (pCanvas.width !== canvas.width || pCanvas.height !== canvas.height) {
-        pCanvas.width = canvas.width;
-        pCanvas.height = canvas.height;
-      }
-      const pCtx = pCanvas.getContext('2d');
 
       const {
         displayMode: curMode,

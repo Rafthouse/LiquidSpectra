@@ -11,7 +11,7 @@
  * - 3 Visualization Engines: Peak-Accurate Continuous Spline Curve, Studio Octave Bars (RTA), Stepped Octaves
  */
 
-import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { AudioTrack, AnalyzerSettings, FrequencyScale, DisplayRange, DISPLAY_RANGE_PRESETS, CollisionEvent } from '../../types/audio';
 import { audioEngine } from '../../audio/AudioEngine';
 import { MasterMeterStrip } from '../common/MasterMeterStrip';
@@ -25,7 +25,6 @@ import {
   Radio,
   AlertTriangle,
   X,
-  Pin,
   Snowflake,
   TrendingUp,
 } from 'lucide-react';
@@ -34,9 +33,6 @@ interface SpectrumViewProps {
   tracks: AudioTrack[];
   settings: AnalyzerSettings;
   onUpdateSettings?: (newSettings: AnalyzerSettings) => void;
-  onUpdateTrack?: (updatedTrack: AudioTrack) => void;
-  masterVolume?: number;
-  onChangeMasterVolume?: (vol: number) => void;
 }
 
 // Convert Hz to Musical Note and Cents deviation
@@ -142,9 +138,6 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
   tracks,
   settings,
   onUpdateSettings,
-  onUpdateTrack,
-  masterVolume = 0.85,
-  onChangeMasterVolume,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -1347,7 +1340,7 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
                   </p>
                 </div>
               ) : (
-                detectedCollisionsList.map((c, i) => (
+                detectedCollisionsList.map((c) => (
                   <div
                     key={`${c.trackAId}__${c.trackBId}__${c.criticalBand}`}
                     className="p-3 rounded-xl bg-slate-900/80 border border-amber-500/30 flex flex-col gap-2 shadow-sm"
@@ -1386,10 +1379,7 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
       </div>
 
       {/* FabFilter Master Output Peak / RMS Meter Strip (Right Edge) */}
-      <MasterMeterStrip
-        masterVolume={masterVolume}
-        onChangeMasterVolume={onChangeMasterVolume || (() => {})}
-      />
+      <MasterMeterStrip />
     </div>
   );
 };

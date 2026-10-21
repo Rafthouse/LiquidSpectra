@@ -17,7 +17,6 @@ import {
   X,
   CheckCircle2,
   Cpu,
-  Layers,
 } from 'lucide-react';
 
 interface TopBarProps {
@@ -40,6 +39,7 @@ const MODES: { id: ModuleMode; label: string }[] = [
   { id: 'loudness', label: 'Loudness' },
   { id: 'stereo', label: 'Stereo' },
   { id: 'oscilloscope', label: 'Oscilloscope' },
+  { id: 'cpp_export', label: 'C++ Plugin' },
 ];
 
 export const TopBar: React.FC<TopBarProps> = ({

@@ -17,14 +17,21 @@ import {
   Cpu,
   Monitor,
   Laptop,
-  Terminal,
   Rocket,
   Sparkles,
-  ExternalLink,
 } from 'lucide-react';
 import JSZip from 'jszip';
 
 type ViewTab = 'explorer' | 'build_guide' | 'tests';
+
+// Kept in step with plugin/BUILD_GUIDE.md
+const WINDOWS_BUILD_COMMANDS = `cmake -B build -A x64
+cmake --build build --config Release --parallel
+ctest --test-dir build -C Release --output-on-failure`;
+
+const MAC_BUILD_COMMANDS = `cmake -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+cmake --build build --config Release --parallel
+ctest --test-dir build -C Release --output-on-failure`;
 
 export const CppExportView: React.FC = () => {
   const [activeTab, setActiveTab] = useState<ViewTab>('build_guide');
@@ -77,42 +84,6 @@ export const CppExportView: React.FC = () => {
         folder.file(f.path, f.content);
       });
 
-      // Add comprehensive Readme
-      folder.file(
-        'README.md',
-        `# LiquidSpectra Multi-Track Analyzer (VST3 / AU / Standalone)
-Next-Generation C++20 / JUCE 8 VST3 and Audio Unit Plugin with 60 FPS Native Vector GUI.
-
-## Features
-- Real-time multi-track frequency spectrum analysis
-- Lock-free inter-instance communication bus (MultiInstanceBus)
-- Psychoacoustic frequency collision and masking detection (Bark critical bands)
-- ITU-R BS.1770-4 / EBU R128 loudness metering and True Peak
-- Native FabFilter-style vector UI (OpenGL / Direct2D / Metal accelerated)
-- SIMD AVX2/NEON optimizations
-- GitHub Actions CI/CD automated cloud builder (.github/workflows/build-plugins.yml)
-
-## Quick Cloud Build via GitHub Actions (Zero Local Setup)
-1. Push this folder to a GitHub repository.
-2. Go to Actions tab -> "Build LiquidSpectra VST3 & AU".
-3. Download ready compiled binaries for Windows (.vst3) and macOS (.vst3 + .component) from Artifacts!
-
-## Local Build (Windows)
-\`\`\`bash
-mkdir build && cd build
-cmake .. -G "Visual Studio 17 2022" -A x64
-cmake --build . --config Release --parallel
-\`\`\`
-
-## Local Build (macOS)
-\`\`\`bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
-cmake --build . --config Release --parallel
-\`\`\`
-`
-      );
-
       const content = await zip.generateAsync({ type: 'blob' });
       const url = URL.createObjectURL(content);
       const link = document.createElement('a');
@@ -147,7 +118,7 @@ cmake --build . --config Release --parallel
               </span>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              100% нативний C++ рушій без WebView, з апаратним векторним рендерером та автоматичною хмарною збіркою.
+              Нативний C++ плагін на JUCE (без WebView) із тестами DSP і автоматичною хмарною збіркою.
             </p>
           </div>
         </div>
@@ -214,8 +185,8 @@ cmake --build . --config Release --parallel
                   Коли і як ви отримаєте свої плагіни для Windows та MacOS?
                 </h3>
                 <p className="text-xs text-slate-300 mt-1 leading-relaxed">
-                  Оскільки цей хмарний веб-сервер працює у Linux-контейнері і не має нативних компіляторів Apple Xcode та Windows MSVC,
-                  ми налаштували для вас <strong>автоматичну хмарну збірку через GitHub Actions</strong>. Завантажте ZIP, запустіть репозиторій — і через <strong>5-7 хвилин</strong> готові <code className="text-cyan-400">.vst3</code> (Windows) та <code className="text-cyan-400">.vst3 / .component</code> (macOS Universal M-серія + Intel) будуть у вас на комп'ютері!
+                  Якщо на комп'ютері немає Visual Studio чи Xcode, скористайтеся <strong>автоматичною збіркою через GitHub Actions</strong>:
+                  завантажте ZIP, створіть із нього репозиторій — GitHub прожене DSP-тести й збере <code className="text-cyan-400">.vst3</code> (Windows) та <code className="text-cyan-400">.vst3 / .component</code> (macOS Universal: Apple Silicon + Intel).
                 </p>
               </div>
 
@@ -256,7 +227,7 @@ cmake --build . --config Release --parallel
                   </div>
                   <div className="flex items-start gap-2">
                     <span className="text-cyan-400 font-bold">Крок 3:</span>
-                    <span>У вкладці Actions через 5 хв завантажте готові .vst3 та .component</span>
+                    <span>Після завершення збірки завантажте .vst3 та .component у вкладці Actions → Artifacts</span>
                   </div>
                 </div>
                 <span className="text-[11px] text-slate-500">
@@ -275,7 +246,7 @@ cmake --build . --config Release --parallel
                 <div>
                   <h4 className="text-sm font-bold text-white">2. Локальна збірка (Windows)</h4>
                   <p className="text-xs text-slate-400 mt-1">
-                    Потрібно: Visual Studio 2022 Community (безкоштовна) + CMake.
+                    Потрібно: Visual Studio 2022 або 2026 (Desktop development with C++) + CMake 3.22+.
                   </p>
                 </div>
                 <div className="bg-slate-950/80 p-2.5 rounded-xl border border-white/5 flex flex-col gap-1.5">
@@ -284,7 +255,7 @@ cmake --build . --config Release --parallel
                     <button
                       onClick={() =>
                         handleCopyCommand(
-                          'mkdir build && cd build\ncmake .. -G "Visual Studio 17 2022" -A x64\ncmake --build . --config Release --parallel',
+                          WINDOWS_BUILD_COMMANDS,
                           'win_cmd'
                         )
                       }
@@ -295,14 +266,12 @@ cmake --build . --config Release --parallel
                     </button>
                   </div>
                   <pre className="text-[11px] font-mono text-cyan-300 overflow-x-auto whitespace-pre leading-relaxed">
-{`mkdir build && cd build
-cmake .. -G "Visual Studio 17 2022" -A x64
-cmake --build . --config Release --parallel`}
+                    {WINDOWS_BUILD_COMMANDS}
                   </pre>
                 </div>
                 <span className="text-[11px] text-slate-500">
-                  Встановлюється прямо в: <br />
-                  <code className="text-slate-300">C:\\Program Files\\Common Files\\VST3\\</code>
+                  Скопіюйте LiquidSpectra.vst3 у (потрібні права адміністратора): <br />
+                  <code className="text-slate-300">{'C:\\Program Files\\Common Files\\VST3\\'}</code>
                 </span>
               </div>
 
@@ -326,7 +295,7 @@ cmake --build . --config Release --parallel`}
                     <button
                       onClick={() =>
                         handleCopyCommand(
-                          'mkdir build && cd build\ncmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"\ncmake --build . --config Release --parallel',
+                          MAC_BUILD_COMMANDS,
                           'mac_cmd'
                         )
                       }
@@ -337,14 +306,11 @@ cmake --build . --config Release --parallel`}
                     </button>
                   </div>
                   <pre className="text-[11px] font-mono text-indigo-300 overflow-x-auto whitespace-pre leading-relaxed">
-{`mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release \\
-  -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
-cmake --build . --config Release --parallel`}
+                    {MAC_BUILD_COMMANDS}
                   </pre>
                 </div>
                 <span className="text-[11px] text-slate-500">
-                  Встановлюється для Logic Pro, Ableton, FL Studio:<br />
+                  Скопіюйте для Logic Pro, Ableton, FL Studio у:<br />
                   <code className="text-slate-300">~/Library/Audio/Plug-Ins/VST3/ & Components/</code>
                 </span>
               </div>
@@ -353,25 +319,25 @@ cmake --build . --config Release --parallel`}
             {/* FabFilter Comparison Specs */}
             <div className="p-4 rounded-2xl bg-slate-900/60 border border-white/10 backdrop-blur-xl flex flex-col gap-3">
               <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                Чому це працює як FabFilter (Без WebView та без навантаження на процесор)
+                Як влаштований плагін
               </h4>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
                 <div className="p-3 rounded-xl bg-slate-950/50 border border-white/5">
-                  <div className="font-semibold text-white mb-1">⚡ 100% C++20 Vector Rendering</div>
+                  <div className="font-semibold text-white mb-1">⚡ Нативний JUCE-інтерфейс</div>
                   <p className="text-slate-400 text-[11px] leading-relaxed">
-                    Жодного вбудованого браузера (WebView2/WKWebView)! Рендериться через нативний C++ та OpenGL/Direct2D/Metal на 60 FPS, використовуючи лише 0.2–0.4% ЦП.
+                    Без вбудованого браузера (WebView2/WKWebView): редактор малюється засобами JUCE (Direct2D на Windows, CoreGraphics на macOS) з частотою 60 FPS. Аудіопотік не виділяє пам'ять і не бере блокувань.
                   </p>
                 </div>
                 <div className="p-3 rounded-xl bg-slate-950/50 border border-white/5">
                   <div className="font-semibold text-white mb-1">🔗 Lock-Free Inter-Plugin Bus</div>
                   <p className="text-slate-400 text-[11px] leading-relaxed">
-                    Плагіни на різних доріжках DAW (наприклад, бочка та бас) синхронізуються через атомарну спільну пам'ять без затримок і м'ютексів для миттєвого виявлення конфліктів.
+                    Плагіни на різних доріжках DAW (наприклад, бочка та бас) обмінюються спектрами через спільну пам'ять процесу без м'ютексів (seqlock) — так виявляються конфлікти між доріжками. Хости, що ізолюють плагіни в окремих процесах, цього не підтримують.
                   </p>
                 </div>
                 <div className="p-3 rounded-xl bg-slate-950/50 border border-white/5">
                   <div className="font-semibold text-white mb-1">📐 Психоакустика Барка та EBU R128</div>
                   <p className="text-slate-400 text-[11px] leading-relaxed">
-                    4096-точкове FFT перетворюється у 24 критичні смуги слуху людини, паралельно вимірюючи інтегровану гучність за стандартом ITU-R BS.1770-4.
+                    4096-точкове FFT групується у 24 критичні смуги слуху; гучність (M / S / I / LRA) і true peak вимірюються за ITU-R BS.1770-4 і перевірені еталонними сигналами EBU.
                   </p>
                 </div>
               </div>

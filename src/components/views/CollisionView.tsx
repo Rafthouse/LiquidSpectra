@@ -14,12 +14,7 @@ import {
   Pin,
   Trash2,
   Activity,
-  ChevronDown,
-  ChevronUp,
   X,
-  Layers,
-  Eye,
-  EyeOff,
 } from 'lucide-react';
 
 interface CollisionViewProps {

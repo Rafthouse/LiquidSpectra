@@ -26,24 +26,12 @@
  *    - Zero audio coloration (100% bit-transparent measurement instrument)
  */
 
-import React, { useRef, useEffect, useState, useMemo, useCallback } from 'react';
+import React, { useRef, useEffect, useState, useMemo } from 'react';
 import { AudioTrack, AnalyzerSettings, SonogramPalette } from '../../types/audio';
 import { audioEngine } from '../../audio/AudioEngine';
 import {
-  Layers,
-  Sparkles,
   Snowflake,
-  Play,
-  RotateCcw,
-  Sliders,
-  Maximize2,
-  Crosshair,
-  Volume2,
-  Eye,
-  EyeOff,
   Music,
-  Compass,
-  Grid,
 } from 'lucide-react';
 
 interface SonogramViewProps {
@@ -112,8 +100,9 @@ export const SonogramView: React.FC<SonogramViewProps> = ({ tracks, settings }) 
   // Read by the long-lived canvas loop and its drawing helpers
   const showPianoRollRef = useRef(showPianoRoll);
   showPianoRollRef.current = showPianoRoll;
-  const [sensitivityDb, setSensitivityDb] = useState<number>(-80); // Min floor
-  const [colorGain, setColorGain] = useState<number>(1.2); // Contrast / Intensity
+  // Fixed display calibration (no UI controls them)
+  const sensitivityDb = -80; // Min floor (dB)
+  const colorGain = 1.2; // Contrast / intensity
 
   // Per-track visibility toggles
   const [visibleTrackIds, setVisibleTrackIds] = useState<Set<string>>(() => {

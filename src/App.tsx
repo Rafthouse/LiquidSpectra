@@ -4,7 +4,7 @@
  * EBU R128 loudness metering, stereo goniometer, synchronized oscilloscope, and C++20 VST3/AU architecture.
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import { lazy, Suspense, useState, useEffect } from 'react';
 import {
   AudioTrack,
   AnalyzerSettings,
@@ -20,6 +20,11 @@ import { CollisionView } from './components/views/CollisionView';
 import { LoudnessView } from './components/views/LoudnessView';
 import { StereoView } from './components/views/StereoView';
 import { OscilloscopeView } from './components/views/OscilloscopeView';
+
+// Loaded on demand: bundles the C++ sources and JSZip, which the analyser views never need
+const CppExportView = lazy(() =>
+  import('./components/views/CppExportView').then((m) => ({ default: m.CppExportView }))
+);
 
 const INITIAL_TRACKS: AudioTrack[] = [
   {
@@ -152,7 +157,6 @@ export default function App() {
   const [activeMode, setActiveMode] = useState<ModuleMode>('spectrum');
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [isMicActive, setIsMicActive] = useState<boolean>(false);
-  const [masterVolume, setMasterVolume] = useState<number>(1.0);
 
   // UI Theme & Scaling
   const [isDark, setIsDark] = useState<boolean>(() => {
@@ -160,8 +164,6 @@ export default function App() {
   });
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [zoomScale, setZoomScale] = useState<number>(1.0);
-
-  const appContainerRef = useRef<HTMLDivElement | null>(null);
 
   // Sync Dark mode class on root HTML document
   useEffect(() => {
@@ -260,18 +262,8 @@ export default function App() {
     setTracks((prev) => prev.map((t) => (t.id === updatedTrack.id ? updatedTrack : t)));
   };
 
-  const handleAddTrack = (newTrack: AudioTrack) => {
-    setTracks((prev) => [...prev, newTrack]);
-  };
-
-  const handleChangeMasterVolume = (vol: number) => {
-    setMasterVolume(vol);
-    audioEngine.setMasterVolume(vol);
-  };
-
   return (
     <div
-      ref={appContainerRef}
       className={`h-screen max-h-screen w-full flex flex-col font-sans transition-colors duration-200 select-none overflow-hidden
         ${
           isDark
@@ -322,9 +314,6 @@ export default function App() {
               tracks={tracks}
               settings={settings}
               onUpdateSettings={setSettings}
-              onUpdateTrack={handleUpdateTrack}
-              masterVolume={masterVolume}
-              onChangeMasterVolume={handleChangeMasterVolume}
             />
           )}
           {activeMode === 'sonogram' && (
@@ -350,6 +339,15 @@ export default function App() {
           {activeMode === 'oscilloscope' && (
             <OscilloscopeView tracks={tracks} settings={settings} />
           )}
+          {activeMode === 'cpp_export' && (
+            <div className="flex-1 min-h-0 overflow-hidden p-3 flex flex-col">
+              <Suspense
+                fallback={<div className="m-auto text-xs font-mono text-slate-400">Завантаження C++ проєкту…</div>}
+              >
+                <CppExportView />
+              </Suspense>
+            </div>
+          )}
         </div>
       </main>
 
@@ -357,11 +355,8 @@ export default function App() {
       <FabFilterBottomBar
         settings={settings}
         onUpdateSettings={setSettings}
-        masterVolume={masterVolume}
-        onChangeMasterVolume={handleChangeMasterVolume}
         tracks={tracks}
         onUpdateTrack={handleUpdateTrack}
-        onAddTrack={handleAddTrack}
         isMicActive={isMicActive}
         onToggleMic={handleToggleMic}
       />

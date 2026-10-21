@@ -33,7 +33,6 @@ export interface OscilloscopeChannelData {
 
 export class AudioEngine {
   private ctx: AudioContext | null = null;
-  private isRunning: boolean = false;
   private fftSize: number = 4096;
   private tracks: Map<string, TrackNodes> = new Map();
   private trackRingBuffers: Map<string, { buffer: Float32Array; writeIndex: number }> = new Map();
@@ -63,11 +62,10 @@ export class AudioEngine {
   private nextNoteTime: number = 0;
   private isPlaying: boolean = false;
 
-  // Custom audio & mic inputs
+  // Mic input and generated test-signal sources
   private micStream: MediaStream | null = null;
   private micSource: MediaStreamAudioSourceNode | null = null;
   private micTrackId: string | null = null;
-  private customAudioBuffers: Map<string, AudioBuffer> = new Map();
   private customAudioSources: Map<string, AudioBufferSourceNode> = new Map();
 
   // Test Signal Generator
@@ -135,8 +133,6 @@ export class AudioEngine {
     if (this.ctx.state === 'suspended') {
       await this.ctx.resume();
     }
-
-    this.isRunning = true;
   }
 
   public registerTrack(track: AudioTrack, fftSize: number = this.fftSize): void {
@@ -267,13 +263,6 @@ export class AudioEngine {
     nodes.panNode.pan.setTargetAtTime(track.pan, this.ctx.currentTime, 0.02);
   }
 
-  public updateTrackFilter(
-    _trackId: string,
-    _filter: { enabled: boolean; frequency: number; gain: number; q: number }
-  ): void {
-    // 100% Bit-Transparent Pure Audio Multi-Analyzer (Zero Audio Coloration / No Filtering)
-  }
-
   public setFftSize(size: number): void {
     this.fftSize = size;
     this.tracks.forEach((nodes) => {
@@ -290,11 +279,6 @@ export class AudioEngine {
         // Fallback
       }
     }
-  }
-
-  public setMasterVolume(vol: number): void {
-    if (!this.ctx || !this.masterGain) return;
-    this.masterGain.gain.setTargetAtTime(Math.max(0, Math.min(1.5, vol)), this.ctx.currentTime, 0.02);
   }
 
   public getMasterOutputLevels(): {
@@ -429,10 +413,6 @@ export class AudioEngine {
     } else {
       this.startPlayback();
     }
-    return this.isPlaying;
-  }
-
-  public getIsPlaying(): boolean {
     return this.isPlaying;
   }
 
@@ -773,40 +753,6 @@ export class AudioEngine {
     }
   }
 
-  // --- User File Upload Handler ---
-  public async loadUserAudioFile(trackId: string, file: File): Promise<boolean> {
-    try {
-      await this.initAudio();
-      if (!this.ctx) return false;
-
-      const arrayBuffer = await file.arrayBuffer();
-      const audioBuffer = await this.ctx.decodeAudioData(arrayBuffer);
-      this.customAudioBuffers.set(trackId, audioBuffer);
-
-      // Play audio on loop
-      const nodes = this.tracks.get(trackId);
-      if (nodes) {
-        // Stop previous if exists
-        const prev = this.customAudioSources.get(trackId);
-        if (prev) {
-          try { prev.stop(); prev.disconnect(); } catch {}
-        }
-
-        const source = this.ctx.createBufferSource();
-        source.buffer = audioBuffer;
-        source.loop = true;
-        source.connect(nodes.inputNode);
-        source.start();
-        this.customAudioSources.set(trackId, source);
-        return true;
-      }
-      return false;
-    } catch (e) {
-      console.error('Error loading audio file:', e);
-      return false;
-    }
-  }
-
   // --- Real-Time Analysis Data Queries ---
 
   public getTrackFrequencyData(trackId: string, outArray: Float32Array): void {
@@ -822,32 +768,6 @@ export class AudioEngine {
         const factor = b / subBins;
         outArray[b] = Math.max(-120, outArray[b] - (1 - factor) * 45);
       }
-    } else {
-      outArray.fill(-120);
-    }
-  }
-
-  public getTrackByteFrequencyData(trackId: string, outArray: Uint8Array): void {
-    const nodes = this.tracks.get(trackId);
-    if (nodes) {
-      nodes.analyserNode.getByteFrequencyData(outArray as unknown as Uint8Array<ArrayBuffer>);
-    } else {
-      outArray.fill(0);
-    }
-  }
-
-  public getTrackTimeDomainData(trackId: string, outArray: Float32Array): void {
-    const nodes = this.tracks.get(trackId);
-    if (nodes) {
-      nodes.analyserNode.getFloatTimeDomainData(outArray as unknown as Float32Array<ArrayBuffer>);
-    } else {
-      outArray.fill(0);
-    }
-  }
-
-  public getMasterFrequencyData(outArray: Float32Array): void {
-    if (this.masterAnalyser) {
-      this.masterAnalyser.getFloatFrequencyData(outArray as unknown as Float32Array<ArrayBuffer>);
     } else {
       outArray.fill(-120);
     }
@@ -1329,16 +1249,6 @@ export class AudioEngine {
       peakNeg,
       maxPeak: Math.max(peakPos, Math.abs(peakNeg)),
     };
-  }
-
-  // Backwards-compatible waveform getter
-  public getOscilloscopeWaveform(trackId: string, timebaseMs: number, triggerMode: 'auto' | 'norm' | 'freeze'): Float32Array {
-    const frame = this.getOscilloscopeChannelData(
-      trackId,
-      timebaseMs,
-      triggerMode === 'freeze' ? 'freeze' : triggerMode === 'norm' ? 'trigger' : 'free'
-    );
-    return frame ? frame.centerValues : new Float32Array(1000);
   }
 }
 

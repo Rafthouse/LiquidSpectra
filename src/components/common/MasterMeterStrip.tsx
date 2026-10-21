@@ -2,8 +2,6 @@ import React, { useRef, useEffect, useState } from 'react';
 import { audioEngine } from '../../audio/AudioEngine';
 
 interface MasterMeterStripProps {
-  masterVolume?: number;
-  onChangeMasterVolume?: (vol: number) => void;
   className?: string;
 }
 
