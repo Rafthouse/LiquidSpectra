@@ -2,7 +2,7 @@ name: Build & Package LiquidSpectra Installers (Windows & macOS)
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, feat/plugin-gui-parity ]
   workflow_dispatch:
 
 jobs:
