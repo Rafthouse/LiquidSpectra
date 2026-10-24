@@ -17,6 +17,7 @@ import busH from '../../plugin/Source/MultiInstanceBus.h?raw';
 import spectralH from '../../plugin/Source/SpectralAnalyzerDSP.h?raw';
 import collisionH from '../../plugin/Source/CollisionDetector.h?raw';
 import loudnessH from '../../plugin/Source/LoudnessMeterEBU.h?raw';
+import sampleRingH from '../../plugin/Source/SampleRing.h?raw';
 import skiaH from '../../plugin/Source/SkiaVectorRenderer.h?raw';
 import skiaCpp from '../../plugin/Source/SkiaVectorRenderer.cpp?raw';
 import testsCpp from '../../plugin/Tests/DSPUnitTests.cpp?raw';
@@ -55,6 +56,8 @@ export const CPP_PROJECT_FILES: CppFile[] = [
     description: 'Cross-track masking detection with EQ suggestions' },
   { name: 'LoudnessMeterEBU.h', path: 'Source/LoudnessMeterEBU.h', language: 'cpp', content: loudnessH,
     description: 'ITU-R BS.1770-4 / EBU R128 meter: K-weighting, gating, LRA, 4x true peak — real-time safe' },
+  { name: 'SampleRing.h', path: 'Source/SampleRing.h', language: 'cpp', content: sampleRingH,
+    description: 'Lock-free stereo sample history feeding the Oscilloscope and Stereo views' },
   { name: 'SkiaVectorRenderer.h', path: 'Source/SkiaVectorRenderer.h', language: 'cpp', content: skiaH,
     description: 'Experimental Skia renderer (reference only, not compiled — Skia is not bundled)' },
   { name: 'SkiaVectorRenderer.cpp', path: 'Source/SkiaVectorRenderer.cpp', language: 'cpp', content: skiaCpp,

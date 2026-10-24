@@ -71,6 +71,7 @@ void LiquidSpectraAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer
         const auto* const* channels = mainInput.getArrayOfReadPointers();
         spectralAnalyzer.pushSamples (channels, numChannels, numSamples);
         loudnessMeter.processBlock (channels, numChannels, numSamples);
+        sampleRing.push (channels[0], numChannels > 1 ? channels[1] : channels[0], numSamples);
 
         const auto& bark = spectralAnalyzer.getLatestBarkMagnitudes();
         getSharedBus().publishSpectrum (instanceId, bark.data(), (int) bark.size());
@@ -135,6 +136,9 @@ void LiquidSpectraAudioProcessor::getStateInformation (juce::MemoryBlock& destDa
     juce::ValueTree state ("LiquidSpectraState");
     state.setProperty ("trackName", getTrackName(), nullptr);
     state.setProperty ("trackColour", (juce::int64) getTrackColour().getARGB(), nullptr);
+    state.setProperty ("displayFloorDb", (double) getDisplayFloorDb(), nullptr);
+    state.setProperty ("showOverlay", getShowOverlay(), nullptr);
+    state.setProperty ("clashThreshold", (double) getClashThreshold(), nullptr);
 
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
@@ -158,6 +162,13 @@ void LiquidSpectraAudioProcessor::setStateInformation (const void* data, int siz
             trackColour = juce::Colour ((juce::uint32) (juce::int64) state["trackColour"]);
     }
     publishTrackInfo();
+
+    if (state.hasProperty ("displayFloorDb"))
+        setDisplayFloorDb ((float) (double) state["displayFloorDb"]);
+    if (state.hasProperty ("showOverlay"))
+        setShowOverlay ((bool) state["showOverlay"]);
+    if (state.hasProperty ("clashThreshold"))
+        setClashThreshold ((float) (double) state["clashThreshold"]);
 }
 
 juce::AudioProcessorEditor* LiquidSpectraAudioProcessor::createEditor()

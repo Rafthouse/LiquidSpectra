@@ -2,10 +2,12 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_dsp/juce_dsp.h>
+#include <atomic>
 #include "SpectralAnalyzerDSP.h"
 #include "CollisionDetector.h"
 #include "LoudnessMeterEBU.h"
 #include "MultiInstanceBus.h"
+#include "SampleRing.h"
 
 namespace LiquidAudio {
 
@@ -47,9 +49,18 @@ public:
     void setTrackColour (juce::Colour c);
     juce::Colour getTrackColour() const;
 
+    // Display settings chosen in the editor (GUI thread writes, GUI timer reads; saved with the project)
+    float getDisplayFloorDb() const noexcept { return displayFloorDb.load (std::memory_order_relaxed); }
+    void setDisplayFloorDb (float db) noexcept { displayFloorDb.store (juce::jlimit (-120.0f, -40.0f, db), std::memory_order_relaxed); }
+    bool getShowOverlay() const noexcept { return showOverlay.load (std::memory_order_relaxed); }
+    void setShowOverlay (bool show) noexcept { showOverlay.store (show, std::memory_order_relaxed); }
+    float getClashThreshold() const noexcept { return clashThreshold.load (std::memory_order_relaxed); }
+    void setClashThreshold (float threshold) noexcept { clashThreshold.store (juce::jlimit (0.05f, 0.95f, threshold), std::memory_order_relaxed); }
+
     const SpectralAnalyzerDSP& getSpectralAnalyzer() const noexcept { return spectralAnalyzer; }
     LoudnessMeterEBU& getLoudnessMeter() noexcept { return loudnessMeter; }
     static MultiInstanceBus& getSharedBus() noexcept;
+    StereoSampleRing& getSampleRing() noexcept { return sampleRing; }
 
 private:
     void publishTrackInfo();
@@ -60,8 +71,13 @@ private:
     juce::String trackName { "Track" };
     juce::Colour trackColour { juce::Colours::cyan };
 
+    std::atomic<float> displayFloorDb { -90.0f };
+    std::atomic<bool> showOverlay { true };
+    std::atomic<float> clashThreshold { 0.40f };
+
     SpectralAnalyzerDSP spectralAnalyzer;
     LoudnessMeterEBU loudnessMeter;
+    StereoSampleRing sampleRing;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LiquidSpectraAudioProcessor)
 };
