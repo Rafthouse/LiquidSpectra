@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 
 namespace LiquidAudio {
 
@@ -14,7 +15,6 @@ namespace
     constexpr float GRID_STEP_DB = 12.0f;
     constexpr float METER_MIN_DB = -60.0f;
     constexpr float SONOGRAM_SENSITIVITY_DB = -80.0f;
-    constexpr float PEAK_HOLD_DECAY_DB = 0.6f; // per timer frame
     constexpr float LUFS_VIEW_MIN = -60.0f;
     constexpr float LUFS_VIEW_MAX = 0.0f;
     constexpr float INV_SQRT2 = 0.70710678f;
@@ -38,10 +38,19 @@ namespace
     constexpr std::array<float, 4> timebaseMs { 5.0f, 20.0f, 50.0f, 200.0f };
     constexpr std::array<float, 3> scopeGains { 1.0f, 2.0f, 4.0f };
     constexpr std::array<float, 3> persistFades { 1.0f, 0.22f, 0.07f }; // 1 = no persistence
+    constexpr std::array<float, 4> decayPerFrameDb { 0.15f, 0.6f, 1.5f, 0.0f }; // peak hold: slow, medium, fast, hold
+    constexpr std::array<float, 3> tiltDbPerOctave { 0.0f, 3.0f, 4.5f };
+    constexpr std::array<int, 7> smoothingDenominator { 0, 48, 24, 12, 6, 3, 1 }; // 0 = off
     constexpr std::array<std::uint32_t, 8> trackPalette {
         0xff06b6d4, 0xffa855f7, 0xfff59e0b, 0xff10b981,
         0xffef4444, 0xffec4899, 0xff3b82f6, 0xffe2e8f0
     };
+
+    struct ColourStop { float position; std::uint32_t argb; };
+    constexpr ColourStop magmaStops[]   { { 0.0f, 0xff000004 }, { 0.25f, 0xff3b0f70 }, { 0.5f, 0xff8c2981 }, { 0.75f, 0xffde4968 }, { 1.0f, 0xfffcfdbf } };
+    constexpr ColourStop viridisStops[] { { 0.0f, 0xff440154 }, { 0.25f, 0xff3b528b }, { 0.5f, 0xff21908c }, { 0.75f, 0xff5dc863 }, { 1.0f, 0xfffde725 } };
+    constexpr ColourStop cyberStops[]   { { 0.0f, 0xff05020f }, { 0.4f, 0xff7c1d6f }, { 0.7f, 0xffe0208a }, { 1.0f, 0xff22e6ff } };
+    constexpr ColourStop grayStops[]    { { 0.0f, 0xff000000 }, { 1.0f, 0xffffffff } };
 
     juce::Font uiFont (float height, bool bold = false)
     {
@@ -73,6 +82,73 @@ namespace
         return best;
     }
 
+    // Frequency axis mappings (0 = 20 Hz, 1 = 20 kHz), selected by DisplaySettings::frequencyScale
+    float barkOf (float f)  { return 13.0f * std::atan (0.00076f * f) + 3.5f * std::atan ((f / 7500.0f) * (f / 7500.0f)); }
+    float melOf (float f)   { return 2595.0f * std::log10 (1.0f + f / 700.0f); }
+
+    float freqNorm (float freqHz, int scale)
+    {
+        const float f = juce::jlimit (MIN_FREQ, MAX_FREQ, freqHz);
+        switch (scale)
+        {
+            case 1:  return (f - MIN_FREQ) / (MAX_FREQ - MIN_FREQ);
+            case 2:  return (barkOf (f) - barkOf (MIN_FREQ)) / (barkOf (MAX_FREQ) - barkOf (MIN_FREQ));
+            case 3:  return (melOf (f) - melOf (MIN_FREQ)) / (melOf (MAX_FREQ) - melOf (MIN_FREQ));
+            default: return std::log10 (f / MIN_FREQ) / std::log10 (MAX_FREQ / MIN_FREQ);
+        }
+    }
+
+    // Inverse of freqNorm by bisection on a geometric midpoint (the mapping is monotonic)
+    float freqFromNorm (float t, int scale)
+    {
+        float lo = MIN_FREQ, hi = MAX_FREQ;
+        for (int i = 0; i < 40; ++i)
+        {
+            const float mid = std::sqrt (lo * hi);
+            if (freqNorm (mid, scale) < t)
+                lo = mid;
+            else
+                hi = mid;
+        }
+        return std::sqrt (lo * hi);
+    }
+
+    juce::Colour interpolateStops (float norm, const ColourStop* stops, size_t count)
+    {
+        norm = juce::jlimit (0.0f, 1.0f, norm);
+        for (size_t i = 1; i < count; ++i)
+        {
+            if (norm <= stops[i].position)
+            {
+                const float span = stops[i].position - stops[i - 1].position;
+                const float t = span > 0.0f ? (norm - stops[i - 1].position) / span : 1.0f;
+                return juce::Colour (stops[i - 1].argb).interpolatedWith (juce::Colour (stops[i].argb), t);
+            }
+        }
+        return juce::Colour (stops[count - 1].argb);
+    }
+
+    // Sonogram palettes; "liquid" follows the track colour, the rest are fixed ramps
+    juce::Colour paletteColour (float norm, juce::Colour accent, int palette)
+    {
+        switch (palette)
+        {
+            case 1:  return interpolateStops (norm, magmaStops, std::size (magmaStops));
+            case 2:  return interpolateStops (norm, viridisStops, std::size (viridisStops));
+            case 3:  return interpolateStops (norm, cyberStops, std::size (cyberStops));
+            case 4:  return interpolateStops (norm, grayStops, std::size (grayStops));
+            default:
+            {
+                const juce::Colour base (0xff050810);
+                if (norm <= 0.0f)
+                    return base;
+                if (norm < 0.6f)
+                    return base.interpolatedWith (accent, norm / 0.6f);
+                return accent.interpolatedWith (juce::Colours::white, (norm - 0.6f) / 0.4f);
+            }
+        }
+    }
+
     void styleButton (juce::TextButton& button)
     {
         button.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1a202c));
@@ -88,17 +164,6 @@ namespace
         box.setColour (juce::ComboBox::outlineColourId, juce::Colour (0x40ffffff));
         box.setColour (juce::ComboBox::arrowColourId, juce::Colour (0xff06b6d4));
     }
-
-    // Sonogram colour ramp: deep navy -> track colour -> white
-    juce::Colour sonogramColour (float norm, juce::Colour accent)
-    {
-        const juce::Colour base (0xff050810);
-        if (norm <= 0.0f)
-            return base;
-        if (norm < 0.6f)
-            return base.interpolatedWith (accent, norm / 0.6f);
-        return accent.interpolatedWith (juce::Colours::white, (norm - 0.6f) / 0.4f);
-    }
 }
 
 LiquidSpectraAudioProcessorEditor::LiquidSpectraAudioProcessorEditor (LiquidSpectraAudioProcessor& p)
@@ -106,6 +171,9 @@ LiquidSpectraAudioProcessorEditor::LiquidSpectraAudioProcessorEditor (LiquidSpec
 {
     spectrumDb.fill (SpectralAnalyzerDSP::FLOOR_DB);
     peakSpectrumDb.fill (SpectralAnalyzerDSP::FLOOR_DB);
+    displayDb.fill (SpectralAnalyzerDSP::FLOOR_DB);
+    powerPrefix.assign ((size_t) SpectralAnalyzerDSP::NUM_BINS + 1, 0.0);
+    displaySettings = p.getDisplaySettings();
     displayFloorDb = p.getDisplayFloorDb();
     sonogramImage = juce::Image (juce::Image::ARGB, SONOGRAM_COLUMNS, SONOGRAM_ROWS, true);
     scratchLeft.resize (StereoSampleRing::CAPACITY, 0.0f);
@@ -128,6 +196,7 @@ LiquidSpectraAudioProcessorEditor::LiquidSpectraAudioProcessorEditor (LiquidSpec
     styleButton (freezeButton);
     styleButton (overlayButton);
     styleButton (peakButton);
+    styleButton (displayButton);
     freezeButton.setClickingTogglesState (true);
     overlayButton.setClickingTogglesState (true);
     peakButton.setClickingTogglesState (true);
@@ -137,6 +206,7 @@ LiquidSpectraAudioProcessorEditor::LiquidSpectraAudioProcessorEditor (LiquidSpec
         audioProcessor.setShowOverlay (overlayButton.getToggleState());
         repaint();
     };
+    displayButton.onClick = [this] { showDisplayMenu(); };
 
     styleCombo (floorBox);
     floorBox.addItem ("Floor -60 dB", 1);
@@ -204,6 +274,7 @@ LiquidSpectraAudioProcessorEditor::LiquidSpectraAudioProcessorEditor (LiquidSpec
     };
 
     addAndMakeVisible (freezeButton);
+    addAndMakeVisible (displayButton);
     addAndMakeVisible (overlayButton);
     addAndMakeVisible (peakButton);
     addAndMakeVisible (floorBox);
@@ -247,6 +318,7 @@ void LiquidSpectraAudioProcessorEditor::updateControlVisibility()
     const bool scopeLike = viewMode == ViewMode::stereo || viewMode == ViewMode::oscilloscope;
 
     freezeButton.setVisible (spectrumLike || scopeLike);
+    displayButton.setVisible (spectrumLike || scopeLike);
     overlayButton.setVisible (viewMode == ViewMode::spectrum);
     peakButton.setVisible (viewMode == ViewMode::spectrum);
     floorBox.setVisible (spectrumLike);
@@ -290,6 +362,7 @@ void LiquidSpectraAudioProcessorEditor::resized()
         }
     };
     place (freezeButton, 74);
+    place (displayButton, 80);
     place (overlayButton, 84);
     place (peakButton, 66);
     place (floorBox, 120);
@@ -330,6 +403,7 @@ void LiquidSpectraAudioProcessorEditor::timerCallback()
     if (overlayButton.getToggleState() != audioProcessor.getShowOverlay())
         overlayButton.setToggleState (audioProcessor.getShowOverlay(), juce::dontSendNotification);
     displayFloorDb = audioProcessor.getDisplayFloorDb();
+    displaySettings = audioProcessor.getDisplaySettings();
 
     const auto& loudness = audioProcessor.getLoudnessMeter();
 
@@ -343,8 +417,10 @@ void LiquidSpectraAudioProcessorEditor::timerCallback()
     {
         // 1. Spectrum of this instance (consistent copy via the analyser's sequence lock)
         audioProcessor.getSpectralAnalyzer().readSpectrum (spectrumDb);
+        smoothSpectrum();
         updatePeakHold();
-        pushSonogramColumn();
+        for (int i = 0; i < displaySettings.sonogramSpeed; ++i)
+            pushSonogramColumn();
 
         // 2. Every instance on the shared bus, then cross-track masking for this one
         numBusTracks = LiquidSpectraAudioProcessor::getSharedBus().snapshot (busTracks);
@@ -381,14 +457,61 @@ void LiquidSpectraAudioProcessorEditor::timerCallback()
     repaint();
 }
 
+void LiquidSpectraAudioProcessorEditor::smoothSpectrum()
+{
+    const int denominator = smoothingDenominator[(size_t) juce::jlimit (0, 6, displaySettings.smoothing)];
+    if (denominator == 0)
+    {
+        displayDb = spectrumDb;
+        return;
+    }
+
+    // Average power over a 1/N octave band around each bin, using prefix sums for O(bins) cost
+    const int numBins = SpectralAnalyzerDSP::NUM_BINS;
+    const double binHz = audioProcessor.getSpectralAnalyzer().getSampleRate() / (double) SpectralAnalyzerDSP::FFT_SIZE;
+
+    powerPrefix[0] = 0.0;
+    for (int k = 0; k < numBins; ++k)
+        powerPrefix[(size_t) k + 1] = powerPrefix[(size_t) k] + std::pow (10.0, spectrumDb[(size_t) k] / 10.0);
+
+    const double ratio = std::pow (2.0, 0.5 / (double) denominator);
+    displayDb[0] = spectrumDb[0];
+    for (int k = 1; k < numBins; ++k)
+    {
+        const double f = (double) k * binHz;
+        const int lo = juce::jmax (1, (int) std::floor (f / ratio / binHz));
+        const int hi = juce::jmax (lo, juce::jmin (numBins - 1, (int) std::ceil (f * ratio / binHz)));
+        const double average = (powerPrefix[(size_t) hi + 1] - powerPrefix[(size_t) lo]) / (double) (hi - lo + 1);
+        displayDb[(size_t) k] = (float) juce::jmax ((double) SpectralAnalyzerDSP::FLOOR_DB, 10.0 * std::log10 (juce::jmax (average, 1.0e-12)));
+    }
+}
+
 void LiquidSpectraAudioProcessorEditor::updatePeakHold()
 {
+    const float decay = decayPerFrameDb[(size_t) juce::jlimit (0, 3, displaySettings.decay)];
     for (size_t bin = 0; bin < peakSpectrumDb.size(); ++bin)
-        peakSpectrumDb[bin] = juce::jmax (spectrumDb[bin], peakSpectrumDb[bin] - PEAK_HOLD_DECAY_DB);
+        peakSpectrumDb[bin] = juce::jmax (spectrumDb[bin], peakSpectrumDb[bin] - decay);
+}
+
+void LiquidSpectraAudioProcessorEditor::ensureSonogramRows()
+{
+    const int scale = displaySettings.frequencyScale;
+    if (sonogramRowScale == scale && (int) sonogramRowFreq.size() == SONOGRAM_ROWS)
+        return;
+
+    sonogramRowFreq.resize ((size_t) SONOGRAM_ROWS);
+    for (int y = 0; y < SONOGRAM_ROWS; ++y)
+    {
+        const float t = 1.0f - (float) y / (float) (SONOGRAM_ROWS - 1); // image row 0 is the top (highest frequency)
+        sonogramRowFreq[(size_t) y] = freqFromNorm (t, scale);
+    }
+    sonogramRowScale = scale;
 }
 
 void LiquidSpectraAudioProcessorEditor::pushSonogramColumn()
 {
+    ensureSonogramRows();
+
     const juce::Colour accent = audioProcessor.getTrackColour();
     const double sampleRate = audioProcessor.getSpectralAnalyzer().getSampleRate();
     const float binHz = (float) sampleRate / (float) SpectralAnalyzerDSP::FFT_SIZE;
@@ -402,14 +525,12 @@ void LiquidSpectraAudioProcessorEditor::pushSonogramColumn()
         std::memmove (line, line + data.pixelStride, (size_t) (data.pixelStride * (SONOGRAM_COLUMNS - 1)));
     }
 
-    // Newest column on the right; image row 0 is the top (highest frequency)
+    // Newest column on the right
     for (int y = 0; y < SONOGRAM_ROWS; ++y)
     {
-        const float t = 1.0f - (float) y / (float) (SONOGRAM_ROWS - 1);
-        const float freq = MIN_FREQ * std::pow (MAX_FREQ / MIN_FREQ, t);
-        const int bin = juce::jlimit (1, SpectralAnalyzerDSP::NUM_BINS - 1, juce::roundToInt (freq / binHz));
-        const float norm = juce::jlimit (0.0f, 1.0f, (spectrumDb[(size_t) bin] - SONOGRAM_SENSITIVITY_DB) / -SONOGRAM_SENSITIVITY_DB);
-        data.setPixelColour (SONOGRAM_COLUMNS - 1, y, sonogramColour (norm, accent));
+        const int bin = juce::jlimit (1, SpectralAnalyzerDSP::NUM_BINS - 1, juce::roundToInt (sonogramRowFreq[(size_t) y] / binHz));
+        const float norm = juce::jlimit (0.0f, 1.0f, (displayDb[(size_t) bin] - SONOGRAM_SENSITIVITY_DB) / -SONOGRAM_SENSITIVITY_DB);
+        data.setPixelColour (SONOGRAM_COLUMNS - 1, y, paletteColour (norm, accent, displaySettings.palette));
     }
 }
 
@@ -420,6 +541,10 @@ void LiquidSpectraAudioProcessorEditor::renderScopeFrame()
         return;
 
     const bool isScope = viewMode == ViewMode::oscilloscope;
+    const int triggerMode = displaySettings.triggerMode; // 0 auto (roll), 1 norm (hold), 2 freeze
+    if (isScope && triggerMode == 2)
+        return;
+
     const int timebaseIndex = juce::jmax (0, timebaseBox.getSelectedItemIndex());
     const int window = isScope
         ? juce::jlimit (64, StereoSampleRing::CAPACITY / 2, juce::roundToInt (timebaseMs[(size_t) timebaseIndex] * (float) sampleRate / 1000.0f))
@@ -429,6 +554,24 @@ void LiquidSpectraAudioProcessorEditor::renderScopeFrame()
 
     if (! audioProcessor.getSampleRing().readNewest (scratchLeft.data(), scratchRight.data(), span))
         return; // the audio thread overran the copy: keep the previous frame
+
+    // Rising zero-crossing of the left channel in the first half of the span
+    int start = span - window;
+    bool triggered = false;
+    if (isScope)
+    {
+        for (int i = 1; i < span - window; ++i)
+        {
+            if (scratchLeft[(size_t) i - 1] < 0.0f && scratchLeft[(size_t) i] >= 0.0f)
+            {
+                start = i;
+                triggered = true;
+                break;
+            }
+        }
+        if (! triggered && triggerMode == 1)
+            return; // norm: keep the last triggered frame
+    }
 
     const int persistence = juce::jmax (0, persistBox.getSelectedItemIndex());
     const float fade = persistFades[(size_t) persistence];
@@ -455,17 +598,6 @@ void LiquidSpectraAudioProcessorEditor::renderScopeFrame()
             g.drawHorizontalLine (juce::roundToInt ((float) height * (float) i / 8.0f), 0.0f, (float) width);
         g.setColour (juce::Colour (0x30ffffff));
         g.drawHorizontalLine (height / 2, 0.0f, (float) width);
-
-        // Rising zero-crossing of the left channel in the first half of the span; otherwise roll
-        int start = span - window;
-        for (int i = 1; i < span - window; ++i)
-        {
-            if (scratchLeft[(size_t) i - 1] < 0.0f && scratchLeft[(size_t) i] >= 0.0f)
-            {
-                start = i;
-                break;
-            }
-        }
 
         // Min/max envelope per pixel column keeps dense waveforms readable at long timebases
         const float samplesPerColumn = (float) window / (float) width;
@@ -563,14 +695,12 @@ void LiquidSpectraAudioProcessorEditor::renderScopeFrame()
 
 float LiquidSpectraAudioProcessorEditor::freqToX (float freqHz, juce::Rectangle<float> b) const noexcept
 {
-    const float norm = std::log10 (juce::jlimit (MIN_FREQ, MAX_FREQ, freqHz) / MIN_FREQ) / std::log10 (MAX_FREQ / MIN_FREQ);
-    return b.getX() + norm * b.getWidth();
+    return b.getX() + freqNorm (freqHz, displaySettings.frequencyScale) * b.getWidth();
 }
 
 float LiquidSpectraAudioProcessorEditor::freqToY (float freqHz, juce::Rectangle<float> b) const noexcept
 {
-    const float norm = std::log10 (juce::jlimit (MIN_FREQ, MAX_FREQ, freqHz) / MIN_FREQ) / std::log10 (MAX_FREQ / MIN_FREQ);
-    return b.getBottom() - norm * b.getHeight();
+    return b.getBottom() - freqNorm (freqHz, displaySettings.frequencyScale) * b.getHeight();
 }
 
 float LiquidSpectraAudioProcessorEditor::dbToY (float db, juce::Rectangle<float> b) const noexcept
@@ -677,7 +807,8 @@ void LiquidSpectraAudioProcessorEditor::paintSpectrumView (juce::Graphics& g, ju
 {
     paintFrequencyGrid (g, b);
     paintLevelGrid (g, b);
-    paintCollisionRegions (g, b);
+    if (displaySettings.collisionOverlay)
+        paintCollisionRegions (g, b);
     paintOtherTracks (g, b);
     if (peakButton.getToggleState())
         paintPeakHold (g, b);
@@ -687,21 +818,43 @@ void LiquidSpectraAudioProcessorEditor::paintSpectrumView (juce::Graphics& g, ju
 
 void LiquidSpectraAudioProcessorEditor::paintSonogramView (juce::Graphics& g, juce::Rectangle<float> b)
 {
-    // Image spans the view; frequency axis labels run down the left edge
+    // Image spans the view; frequency axis runs down the left edge
     const auto target = b.toNearestInt();
     g.drawImage (sonogramImage, target.getX(), target.getY(), target.getWidth(), target.getHeight(), 0, 0, SONOGRAM_COLUMNS, SONOGRAM_ROWS, false);
 
-    static const float freqs[] = { 30, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 16000 };
-    static const char* labels[] = { "30", "50", "100", "250", "500", "1k", "2k", "5k", "10k", "16k" };
-
     g.setFont (uiFont (10.0f));
-    for (size_t i = 0; i < std::size (freqs); ++i)
+    if (displaySettings.pianoRoll)
     {
-        const float y = freqToY (freqs[i], b);
-        g.setColour (juce::Colour (0x20ffffff));
-        g.drawHorizontalLine ((int) y, b.getX(), b.getRight());
-        g.setColour (juce::Colour (0x90ffffff));
-        g.drawText (labels[i], (int) b.getX() + 4, (int) y - 7, 40, 14, juce::Justification::left);
+        // Piano roll: every semitone is a faint line, C notes are labelled with their octave
+        for (int midi = 12; midi <= 120; ++midi)
+        {
+            const float f = 440.0f * std::pow (2.0f, (float) (midi - 69) / 12.0f);
+            if (f < MIN_FREQ || f > MAX_FREQ)
+                continue;
+
+            const float y = freqToY (f, b);
+            const bool isC = midi % 12 == 0;
+            g.setColour (juce::Colour (isC ? 0x30ffffff : 0x12ffffff));
+            g.drawHorizontalLine ((int) y, b.getX(), b.getRight());
+            if (isC)
+            {
+                g.setColour (juce::Colour (0x90ffffff));
+                g.drawText ("C" + juce::String (midi / 12 - 1), (int) b.getX() + 4, (int) y - 7, 40, 14, juce::Justification::left);
+            }
+        }
+    }
+    else
+    {
+        static const float freqs[] = { 30, 50, 100, 250, 500, 1000, 2000, 5000, 10000, 16000 };
+        static const char* labels[] = { "30", "50", "100", "250", "500", "1k", "2k", "5k", "10k", "16k" };
+        for (size_t i = 0; i < std::size (freqs); ++i)
+        {
+            const float y = freqToY (freqs[i], b);
+            g.setColour (juce::Colour (0x20ffffff));
+            g.drawHorizontalLine ((int) y, b.getX(), b.getRight());
+            g.setColour (juce::Colour (0x90ffffff));
+            g.drawText (labels[i], (int) b.getX() + 4, (int) y - 7, 40, 14, juce::Justification::left);
+        }
     }
 
     paintFrozenBadge (g, b);
@@ -880,8 +1033,10 @@ void LiquidSpectraAudioProcessorEditor::paintOscilloscopeView (juce::Graphics& g
 
     g.setFont (uiFont (9.0f, true));
     g.setColour (juce::Colour (0x80ffffff));
-    g.drawText (timebaseBox.getText() + "  \xc2\xb7  " + gainBox.getText(), b.toNearestInt().removeFromBottom (16).removeFromLeft (240),
-                juce::Justification::left);
+    const juce::String triggerNames[] { "Trigger auto", "Trigger norm", "Trigger freeze" };
+    g.drawText (timebaseBox.getText() + "  \xc2\xb7  " + gainBox.getText() + "  \xc2\xb7  "
+                    + triggerNames[juce::jlimit (0, 2, displaySettings.triggerMode)],
+                b.toNearestInt().removeFromBottom (16).removeFromLeft (360), juce::Justification::left);
 
     paintFrozenBadge (g, b);
 }
@@ -972,19 +1127,29 @@ void LiquidSpectraAudioProcessorEditor::paintOtherTracks (juce::Graphics& g, juc
     }
 }
 
-juce::Path LiquidSpectraAudioProcessorEditor::buildSpectrumCurve (const std::array<float, SpectralAnalyzerDSP::NUM_BINS>& data, juce::Rectangle<float> b) const
+std::vector<float> LiquidSpectraAudioProcessorEditor::computeStepLevels (const std::array<float, SpectralAnalyzerDSP::NUM_BINS>& data, juce::Rectangle<float> b)
 {
-    // One point per ~2 px: maximum of the FFT bins that fall under each step (keeps harmonics crisp)
+    // One step per ~2 px across the view; each step takes the loudest bin under it, plus the spectral tilt
+    const int steps = juce::jmax (2, (int) (b.getWidth() / 2.0f));
+    const int scale = displaySettings.frequencyScale;
+    if (stepFreqScale != scale || stepFreqCount != steps)
+    {
+        stepFreq.resize ((size_t) steps + 1);
+        for (int s = 0; s <= steps; ++s)
+            stepFreq[(size_t) s] = freqFromNorm ((float) s / (float) steps, scale);
+        stepFreqScale = scale;
+        stepFreqCount = steps;
+    }
+
     const double sampleRate = audioProcessor.getSpectralAnalyzer().getSampleRate();
     const float binHz = (float) sampleRate / (float) SpectralAnalyzerDSP::FFT_SIZE;
-    const int steps = juce::jmax (2, (int) (b.getWidth() / 2.0f));
-    const float logSpan = std::log10 (MAX_FREQ / MIN_FREQ);
+    const float tilt = tiltDbPerOctave[(size_t) juce::jlimit (0, 2, displaySettings.tilt)];
 
-    juce::Path curve;
+    std::vector<float> levels ((size_t) steps + 1);
     for (int s = 0; s <= steps; ++s)
     {
-        const float f1 = MIN_FREQ * std::pow (10.0f, logSpan * (float) s / (float) steps);
-        const float f2 = MIN_FREQ * std::pow (10.0f, logSpan * (float) (s + 1) / (float) steps);
+        const float f1 = stepFreq[(size_t) s];
+        const float f2 = s < steps ? stepFreq[(size_t) s + 1] : f1;
         const int bin1 = juce::jlimit (1, SpectralAnalyzerDSP::NUM_BINS - 1, (int) std::floor (f1 / binHz));
         const int bin2 = juce::jlimit (bin1, SpectralAnalyzerDSP::NUM_BINS - 1, (int) std::floor (f2 / binHz));
 
@@ -992,31 +1157,69 @@ juce::Path LiquidSpectraAudioProcessorEditor::buildSpectrumCurve (const std::arr
         for (int bin = bin1; bin <= bin2; ++bin)
             level = juce::jmax (level, data[(size_t) bin]);
 
-        const juce::Point<float> pt { freqToX (f1, b), dbToY (level, b) };
-        if (s == 0)
-            curve.startNewSubPath (pt);
-        else
-            curve.lineTo (pt);
+        levels[(size_t) s] = level + tilt * std::log2 (juce::jmax (f1, 1.0f) / 1000.0f);
     }
-    return curve;
+    return levels;
+}
+
+juce::Path LiquidSpectraAudioProcessorEditor::buildLevelPath (const std::vector<float>& levels, juce::Rectangle<float> b, bool stepped) const
+{
+    const int steps = (int) levels.size() - 1;
+    juce::Path path;
+    float prevY = 0.0f;
+    for (int s = 0; s <= steps; ++s)
+    {
+        const float x = b.getX() + b.getWidth() * (float) s / (float) steps;
+        const float y = dbToY (levels[(size_t) s], b);
+        if (s == 0)
+        {
+            path.startNewSubPath (x, y);
+        }
+        else
+        {
+            if (stepped)
+                path.lineTo (x, prevY);
+            path.lineTo (x, y);
+        }
+        prevY = y;
+    }
+    return path;
 }
 
 void LiquidSpectraAudioProcessorEditor::paintPeakHold (juce::Graphics& g, juce::Rectangle<float> b)
 {
+    const auto levels = computeStepLevels (peakSpectrumDb, b);
     g.setColour (juce::Colour (0x90ffffff));
-    g.strokePath (buildSpectrumCurve (peakSpectrumDb, b), juce::PathStrokeType (1.0f));
+    g.strokePath (buildLevelPath (levels, b, displaySettings.spectrumStyle == 2), juce::PathStrokeType (1.0f));
 }
 
 void LiquidSpectraAudioProcessorEditor::paintSpectrumCurve (juce::Graphics& g, juce::Rectangle<float> b)
 {
-    const auto curve = buildSpectrumCurve (spectrumDb, b);
+    const auto levels = computeStepLevels (displayDb, b);
+    const auto colour = audioProcessor.getTrackColour();
+
+    if (displaySettings.spectrumStyle == 1)
+    {
+        // Bars: one filled column per step, slightly narrower than the step so the bands read separately
+        const int steps = (int) levels.size() - 1;
+        g.setColour (colour.withAlpha (0.55f));
+        for (int s = 0; s < steps; ++s)
+        {
+            const float x1 = b.getX() + b.getWidth() * (float) s / (float) steps;
+            const float x2 = b.getX() + b.getWidth() * (float) (s + 1) / (float) steps;
+            const float top = dbToY (levels[(size_t) s], b);
+            g.fillRect (juce::Rectangle<float> (x1, top, juce::jmax (1.0f, x2 - x1 - 1.0f), b.getBottom() - top));
+        }
+        return;
+    }
+
+    const auto curve = buildLevelPath (levels, b, displaySettings.spectrumStyle == 2);
 
     juce::Path fillPath (curve);
     fillPath.lineTo (b.getRight(), b.getBottom());
     fillPath.lineTo (b.getX(), b.getBottom());
     fillPath.closeSubPath();
 
-    const auto colour = audioProcessor.getTrackColour();
     g.setGradientFill (juce::ColourGradient (colour.withAlpha (0.32f), b.getCentreX(), b.getY(),
                                              colour.withAlpha (0.01f), b.getCentreX(), b.getBottom(), false));
     g.fillPath (fillPath);
@@ -1069,6 +1272,71 @@ void LiquidSpectraAudioProcessorEditor::paintMasterOutputMeter (juce::Graphics& 
     const float maxHold = juce::jmax (peakHoldDb[0], peakHoldDb[1]);
     g.drawText (maxHold <= LoudnessMeterEBU::SILENCE_DB + 0.5f ? juce::String ("-inf") : juce::String (maxHold, 1) + " dBTP",
                 bounds.getX(), bounds.getBottom() - 26, bounds.getWidth(), 20, juce::Justification::centred);
+}
+
+void LiquidSpectraAudioProcessorEditor::showDisplayMenu()
+{
+    const auto& s = displaySettings;
+
+    auto addGroup = [] (juce::PopupMenu& menu, int firstId, std::initializer_list<const char*> names, int selected)
+    {
+        int id = firstId;
+        for (auto* name : names)
+        {
+            menu.addItem (id, name, true, id - firstId == selected);
+            ++id;
+        }
+    };
+
+    juce::PopupMenu scale, smooth, tilt, style, decay, palette, speed, trigger;
+    addGroup (scale, 100, { "Log", "Linear", "Bark", "Mel" }, s.frequencyScale);
+    addGroup (smooth, 110, { "Off", "1/48 oct", "1/24 oct", "1/12 oct", "1/6 oct", "1/3 oct", "1/1 oct" }, s.smoothing);
+    addGroup (tilt, 120, { "Off", "+3 dB/oct", "+4.5 dB/oct" }, s.tilt);
+    addGroup (style, 130, { "Curve", "Bars", "Stepped" }, s.spectrumStyle);
+    addGroup (decay, 140, { "Peak decay slow", "Peak decay medium", "Peak decay fast", "Peak hold" }, s.decay);
+    addGroup (palette, 150, { "Liquid", "Magma", "Viridis", "Cyber", "Grayscale" }, s.palette);
+    addGroup (speed, 160, { "Sonogram 1x", "Sonogram 2x", "Sonogram 3x", "Sonogram 4x", "Sonogram 5x" }, s.sonogramSpeed - 1);
+    addGroup (trigger, 170, { "Trigger auto (roll)", "Trigger norm (hold)", "Trigger freeze" }, s.triggerMode);
+
+    juce::PopupMenu menu;
+    menu.addSubMenu ("Frequency scale", scale);
+    menu.addSubMenu ("Smoothing", smooth);
+    menu.addSubMenu ("Spectral tilt", tilt);
+    menu.addSubMenu ("Spectrum style", style);
+    menu.addSubMenu ("Peak hold", decay);
+    menu.addSubMenu ("Sonogram palette", palette);
+    menu.addSubMenu ("Sonogram speed", speed);
+    menu.addSubMenu ("Scope trigger", trigger);
+    menu.addSeparator();
+    menu.addItem (180, "Piano roll", true, s.pianoRoll);
+    menu.addItem (181, "Collision overlay", true, s.collisionOverlay);
+
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&displayButton),
+                        [safe = juce::Component::SafePointer<LiquidSpectraAudioProcessorEditor> (this)] (int result)
+                        {
+                            if (safe != nullptr && result != 0)
+                                safe->applyDisplayMenu (result);
+                        });
+}
+
+void LiquidSpectraAudioProcessorEditor::applyDisplayMenu (int menuId)
+{
+    auto s = displaySettings;
+    if (menuId >= 100 && menuId < 110)      s.frequencyScale = menuId - 100;
+    else if (menuId >= 110 && menuId < 120) s.smoothing = menuId - 110;
+    else if (menuId >= 120 && menuId < 130) s.tilt = menuId - 120;
+    else if (menuId >= 130 && menuId < 140) s.spectrumStyle = menuId - 130;
+    else if (menuId >= 140 && menuId < 150) s.decay = menuId - 140;
+    else if (menuId >= 150 && menuId < 160) s.palette = menuId - 150;
+    else if (menuId >= 160 && menuId < 170) s.sonogramSpeed = menuId - 159;
+    else if (menuId >= 170 && menuId < 180) s.triggerMode = menuId - 170;
+    else if (menuId == 180)                 s.pianoRoll = ! s.pianoRoll;
+    else if (menuId == 181)                 s.collisionOverlay = ! s.collisionOverlay;
+    else return;
+
+    displaySettings = s;
+    audioProcessor.setDisplaySettings (s);
+    repaint();
 }
 
 void LiquidSpectraAudioProcessorEditor::beginRename()

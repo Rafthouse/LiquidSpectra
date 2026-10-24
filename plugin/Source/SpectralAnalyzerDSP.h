@@ -81,6 +81,9 @@ public:
     /** Critical-band levels from the latest frame (audio thread, same thread as pushSamples). */
     const std::vector<float>& getLatestBarkMagnitudes() const noexcept { return barkDb; }
 
+    /** Latest full-resolution spectrum in dB (audio thread, same thread as pushSamples). */
+    const std::vector<float>& getLatestSpectrumDb() const noexcept { return smoothedDb; }
+
     /** Thread-safe copies for the GUI. Return false if no consistent frame could be read. */
     bool readSpectrum (std::array<float, NUM_BINS>& out) const noexcept { return publishedSpectrum.read (out.data(), out.size()); }
     bool readBark (std::array<float, NUM_BARK_BANDS>& out) const noexcept { return publishedBark.read (out.data(), out.size()); }

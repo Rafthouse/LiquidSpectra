@@ -49,16 +49,45 @@ juce_add_plugin(LiquidSpectra
 
 target_sources(LiquidSpectra PRIVATE
     Source/PluginProcessor.cpp
-    Source/PluginEditor.cpp
+    Source/PluginWebEditor.cpp
 )
 
-# Source/SkiaVectorRenderer.* is an experimental Skia renderer kept for reference; it is not
-# compiled because the project does not ship or link Skia.
+# The editor is the web analyzer (plugin/web/index.html, built by `npm run build:plugin-web`).
+# The page is embedded as binary data, so the plugin is self-contained.
+juce_add_binary_data(LiquidSpectraWebData
+    HEADER_NAME "LiquidSpectraWebData.h"
+    SOURCES web/index.html
+)
 
-target_include_directories(LiquidSpectra PRIVATE Source)
+# Source/PluginEditor.* (native JUCE editor) and Source/SkiaVectorRenderer.* are kept for reference
+# and are not compiled: the web editor replaces them.
+
+target_include_directories(LiquidSpectra PRIVATE
+    Source
+    "${CMAKE_CURRENT_BINARY_DIR}/juce_binarydata_LiquidSpectraWebData/JuceLibraryCode"
+)
+
+# Windows: WebView2 SDK (Microsoft.Web.WebView2 1.0.2903.40, pinned by hash) for the embedded web UI.
+# Linked statically, so the plugin needs no WebView2Loader.dll next to it.
+if(WIN32)
+    set(LIQUIDSPECTRA_WEBVIEW2_URL "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2903.40")
+    set(LIQUIDSPECTRA_WEBVIEW2_SHA256 "ef128016dd1e51c59178c827ed5b8aa3322c57afa8675d930f8109505542ad74")
+    set(LIQUIDSPECTRA_WEBVIEW2_DIR "${CMAKE_BINARY_DIR}/webview2-sdk")
+    if(NOT EXISTS "${LIQUIDSPECTRA_WEBVIEW2_DIR}/build/native/include/WebView2.h")
+        file(DOWNLOAD "${LIQUIDSPECTRA_WEBVIEW2_URL}" "${CMAKE_BINARY_DIR}/webview2-sdk.zip"
+             EXPECTED_HASH SHA256=${LIQUIDSPECTRA_WEBVIEW2_SHA256} TLS_VERIFY ON)
+        file(ARCHIVE_EXTRACT INPUT "${CMAKE_BINARY_DIR}/webview2-sdk.zip" DESTINATION "${LIQUIDSPECTRA_WEBVIEW2_DIR}")
+    endif()
+
+    target_include_directories(LiquidSpectra PRIVATE "${LIQUIDSPECTRA_WEBVIEW2_DIR}/build/native/include")
+    target_link_libraries(LiquidSpectra PRIVATE "${LIQUIDSPECTRA_WEBVIEW2_DIR}/build/native/x64/WebView2LoaderStatic.lib")
+    target_compile_definitions(LiquidSpectra PUBLIC JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1)
+endif()
 
 target_compile_definitions(LiquidSpectra PUBLIC
-    JUCE_WEB_BROWSER=0
+    JUCE_WEB_BROWSER=1
+    # WebView2 on Windows; required for the resource provider that serves the embedded page
+    JUCE_USE_WIN_WEBVIEW2=1
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
 )
@@ -67,6 +96,8 @@ target_link_libraries(LiquidSpectra
     PRIVATE
         juce::juce_audio_utils
         juce::juce_dsp
+        juce::juce_gui_extra
+        LiquidSpectraWebData
     PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags

@@ -4,13 +4,17 @@
 #include <atomic>
 #include <cstdint>
 
+#include <algorithm>
+
 #include "BarkScale.h"
+#include "SampleRing.h"
 #include "SeqLock.h"
 
 namespace LiquidAudio {
 
 constexpr int MAX_SIMULTANEOUS_TRACKS = 32;
 constexpr int TRACK_NAME_CAPACITY = 32;
+constexpr int BUS_SPECTRUM_BINS = 2048; // FFT 4096 / 2
 
 /** Plain, copyable view of one instance's published state (built on the reader side). */
 struct TrackSnapshot
@@ -44,6 +48,10 @@ public:
                 std::array<float, BARK_BANDS_COUNT> silence;
                 silence.fill (-120.0f);
                 slots[(size_t) i].bark.write (silence.data(), silence.size());
+
+                std::array<float, BUS_SPECTRUM_BINS> silentSpectrum;
+                silentSpectrum.fill (-120.0f);
+                slots[(size_t) i].spectrum.write (silentSpectrum.data(), silentSpectrum.size());
                 return i;
             }
         }
@@ -80,6 +88,38 @@ public:
         slots[(size_t) slotIndex].bark.write (barkData, (std::size_t) (numBands < BARK_BANDS_COUNT ? numBands : BARK_BANDS_COUNT));
     }
 
+    /** Full-resolution spectrum (dB) of one instance for the web UI. Single writer per slot (audio thread). */
+    void publishFullSpectrum (int slotIndex, const float* spectrumDb, int numBins) noexcept
+    {
+        if (! isValid (slotIndex) || spectrumDb == nullptr)
+            return;
+
+        slots[(size_t) slotIndex].spectrum.write (spectrumDb, (std::size_t) std::min (numBins, BUS_SPECTRUM_BINS));
+    }
+
+    bool readFullSpectrum (int slotIndex, float* out, int numBins) const noexcept
+    {
+        if (! isValid (slotIndex) || out == nullptr)
+            return false;
+
+        return slots[(size_t) slotIndex].spectrum.read (out, (std::size_t) std::min (numBins, BUS_SPECTRUM_BINS));
+    }
+
+    /** Stereo samples of one instance (audio thread writes, any thread reads with readWaveform). */
+    void pushWaveform (int slotIndex, const float* left, const float* right, int numSamples) noexcept
+    {
+        if (isValid (slotIndex) && left != nullptr && right != nullptr)
+            slots[(size_t) slotIndex].waveform.push (left, right, numSamples);
+    }
+
+    bool readWaveform (int slotIndex, float* outLeft, float* outRight, int count, std::int64_t& endOut) const noexcept
+    {
+        if (! isValid (slotIndex) || count <= 0 || count > (int) BusWaveformRing::CAPACITY)
+            return false;
+
+        return slots[(size_t) slotIndex].waveform.readNewest (outLeft, outRight, count, endOut);
+    }
+
     /** Fills `out` with every registered instance; returns how many were written. Never call from the audio thread. */
     int snapshot (std::array<TrackSnapshot, MAX_SIMULTANEOUS_TRACKS>& out) const noexcept
     {
@@ -111,6 +151,8 @@ private:
         std::atomic<std::uint32_t> colourArgb { 0 };
         SeqLockArray<char, TRACK_NAME_CAPACITY> name;
         SeqLockArray<float, BARK_BANDS_COUNT> bark;
+        SeqLockArray<float, BUS_SPECTRUM_BINS> spectrum;
+        BusWaveformRing waveform;
     };
 
     std::array<Slot, MAX_SIMULTANEOUS_TRACKS> slots;

@@ -11,6 +11,21 @@
 
 namespace LiquidAudio {
 
+/** View options shared with the web analyzer's AnalyzerSettings. GUI-only; saved with the project. */
+struct DisplaySettings
+{
+    int frequencyScale { 0 };  // 0 log, 1 linear, 2 bark, 3 mel
+    int smoothing { 0 };       // 0 none, 1 1/48 ... 6 1/1 octave
+    int tilt { 0 };            // 0 off, 1 +3 dB/oct, 2 +4.5 dB/oct
+    int spectrumStyle { 0 };   // 0 curve, 1 bars, 2 stepped
+    int decay { 1 };           // peak hold: 0 slow, 1 medium, 2 fast, 3 hold
+    int palette { 0 };         // sonogram: 0 liquid, 1 magma, 2 viridis, 3 cyber, 4 grayscale
+    int sonogramSpeed { 1 };   // columns per frame, 1 to 5
+    int triggerMode { 0 };     // scope: 0 auto (roll), 1 norm (hold), 2 freeze
+    bool pianoRoll { true };
+    bool collisionOverlay { true };
+};
+
 class LiquidSpectraAudioProcessor : public juce::AudioProcessor
 {
 public:
@@ -57,10 +72,24 @@ public:
     float getClashThreshold() const noexcept { return clashThreshold.load (std::memory_order_relaxed); }
     void setClashThreshold (float threshold) noexcept { clashThreshold.store (juce::jlimit (0.05f, 0.95f, threshold), std::memory_order_relaxed); }
 
+    DisplaySettings getDisplaySettings() const
+    {
+        const juce::SpinLock::ScopedLockType lock (displayLock);
+        return displaySettings;
+    }
+    void setDisplaySettings (const DisplaySettings& settings)
+    {
+        const juce::SpinLock::ScopedLockType lock (displayLock);
+        displaySettings = settings;
+    }
+
     const SpectralAnalyzerDSP& getSpectralAnalyzer() const noexcept { return spectralAnalyzer; }
     LoudnessMeterEBU& getLoudnessMeter() noexcept { return loudnessMeter; }
     static MultiInstanceBus& getSharedBus() noexcept;
-    StereoSampleRing& getSampleRing() noexcept { return sampleRing; }
+
+    /** Web UI state (opaque JSON from the web app), saved with the project and handed back on load. */
+    void setWebState (const juce::String& json);
+    juce::String getWebState() const;
 
 private:
     void publishTrackInfo();
@@ -74,10 +103,14 @@ private:
     std::atomic<float> displayFloorDb { -90.0f };
     std::atomic<bool> showOverlay { true };
     std::atomic<float> clashThreshold { 0.40f };
+    mutable juce::SpinLock displayLock;
+    DisplaySettings displaySettings;
 
     SpectralAnalyzerDSP spectralAnalyzer;
     LoudnessMeterEBU loudnessMeter;
-    StereoSampleRing sampleRing;
+    mutable juce::SpinLock webStateLock;
+    juce::String webState;
+    std::uint32_t lastPublishedFrameVersion { 0 }; // audio thread only
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LiquidSpectraAudioProcessor)
 };

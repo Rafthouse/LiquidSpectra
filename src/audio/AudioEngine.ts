@@ -7,6 +7,7 @@
 import { AudioTrack, CollisionEvent, LoudnessMetrics, StereoMetrics } from '../types/audio';
 import { BS1770Meter } from './loudness';
 import { ScopeRing, ScopeTrace, findTriggerCrossing, acquireTrace } from './scope';
+import { PluginFrame, isPluginHost, sendToHost, subscribeFrames } from '../plugin/pluginBridge';
 
 // Seconds of audio kept per track: the 10 s timebase plus room to search for a trigger
 const RING_SECONDS = 13;
@@ -50,7 +51,7 @@ export class AudioEngine {
   private ctx: AudioContext | null = null;
   private fftSize: number = 4096;
   private tracks: Map<string, TrackNodes> = new Map();
-  private trackRingBuffers: Map<string, ScopeRing> = new Map();
+  protected trackRingBuffers: Map<string, ScopeRing> = new Map();
   private silentGain: GainNode | null = null;
   private masterGain: GainNode | null = null;
   private masterAnalyser: AnalyserNode | null = null;
@@ -1173,5 +1174,259 @@ export class AudioEngine {
   }
 }
 
-// Singleton Engine Instance
-export const audioEngine = new AudioEngine();
+// --- Plugin host engine -----------------------------------------------------
+
+const PLUGIN_FFT_SIZE = 4096;
+
+const hexColour = (argb: number): string => `#${(argb & 0xffffff).toString(16).padStart(6, '0')}`;
+
+const criticalBandOf = (hz: number): CollisionEvent['criticalBand'] => {
+  if (hz < 120) return 'Sub';
+  if (hz < 300) return 'Bass';
+  if (hz < 800) return 'Low-Mid';
+  if (hz < 2500) return 'Mid';
+  if (hz < 6000) return 'High-Mid';
+  return 'Presence';
+};
+
+/**
+ * Same surface as AudioEngine, fed by the native plugin: the DSP runs in the host and the page renders it.
+ * Each track's scope ring is refilled from the waveform the plugin pushes, so the scope and phase code of the
+ * base class works unchanged.
+ */
+class PluginAudioEngine extends AudioEngine {
+  private frame: PluginFrame | null = null;
+  private waves = new Map<string, { left: Float32Array; right: Float32Array }>();
+  private clipLatched = false;
+
+  constructor() {
+    super();
+    subscribeFrames((frame) => this.ingest(frame));
+  }
+
+  private trackId(slot: number): string {
+    return `plugin-${slot}`;
+  }
+
+  private selfTrackId(): string | undefined {
+    const self = this.frame?.tracks.find((track) => track.self);
+    return self ? this.trackId(self.slot) : undefined;
+  }
+
+  private ingest(frame: PluginFrame): void {
+    this.frame = frame;
+
+    for (const track of frame.tracks) {
+      if (!track.left || !track.right || track.end === undefined) continue;
+
+      const id = this.trackId(track.slot);
+      this.waves.set(id, { left: track.left, right: track.right });
+
+      let ring = this.trackRingBuffers.get(id);
+      if (!ring) {
+        ring = new ScopeRing(RING_SECONDS, frame.sr);
+        this.trackRingBuffers.set(id, ring);
+      }
+      const mono = new Float32Array(track.left.length);
+      for (let i = 0; i < mono.length; i++) mono[i] = 0.5 * (track.left[i] + track.right[i]);
+      ring.write(mono, track.end - mono.length, performance.now());
+    }
+
+    if (Math.max(frame.meter.peakL, frame.meter.peakR) > 0) this.clipLatched = true;
+  }
+
+  public override async initAudio(): Promise<void> {
+    // The host already runs the audio; nothing to start
+  }
+
+  public override registerTrack(_track: AudioTrack, _fftSize?: number): void {
+    // Tracks come from the plugin bus (see getTrackIds)
+  }
+
+  public override unregisterTrack(_trackId: string): void {}
+
+  public override hasTrack(trackId: string): boolean {
+    return this.getTrackIds().includes(trackId);
+  }
+
+  public override getTrackIds(): string[] {
+    return this.frame ? this.frame.tracks.map((track) => this.trackId(track.slot)) : [];
+  }
+
+  public override updateTrackParameters(_track: AudioTrack, _anySolo?: boolean): void {}
+
+  public override setFftSize(_size: number): void {}
+
+  public override getAnalyserFftSize(): number {
+    return PLUGIN_FFT_SIZE;
+  }
+
+  public override getSampleRate(): number {
+    return this.frame?.sr ?? 48000;
+  }
+
+  public override getTrackFrequencyData(trackId: string, outArray: Float32Array): void {
+    const track = this.frame?.tracks.find((candidate) => this.trackId(candidate.slot) === trackId);
+    outArray.fill(-120);
+    if (track) outArray.set(track.spectrum.subarray(0, outArray.length));
+  }
+
+  public override getMasterOutputLevels(): ReturnType<AudioEngine['getMasterOutputLevels']> {
+    const meter = this.frame?.meter ?? { peakL: -120, peakR: -120 };
+    const maxPeakDb = Math.max(meter.peakL, meter.peakR);
+    // The host reports true peaks only; RMS and peak hold follow the peak
+    return {
+      peakL: meter.peakL,
+      peakR: meter.peakR,
+      rmsL: meter.peakL,
+      rmsR: meter.peakR,
+      peakHoldL: meter.peakL,
+      peakHoldR: meter.peakR,
+      maxPeakDb,
+      isClip: this.clipLatched || maxPeakDb > 0,
+    };
+  }
+
+  public override resetMasterClip(): void {
+    this.clipLatched = false;
+  }
+
+  public override startPlayback(): void {}
+
+  public override stopPlayback(): void {}
+
+  public override togglePlayback(): boolean {
+    return false;
+  }
+
+  public override async enableMicrophone(_trackId: string): Promise<boolean> {
+    return false;
+  }
+
+  public override disableMicrophone(): void {}
+
+  public override startTestSignal(_type: 'sine' | 'sweep' | 'pink' | 'white' | '1khz' | '50hz' | '100hz' | '440hz', _trackId: string): void {}
+
+  public override stopTestSignal(): void {}
+
+  public override detectCollisions(activeTracks: AudioTrack[], threshold: number = 0.45): CollisionEvent[] {
+    const frame = this.frame;
+    if (!frame) return [];
+
+    const active = new Set(activeTracks.map((track) => track.id));
+    const colourOf = (slot: number): string | undefined => {
+      const track = frame.tracks.find((candidate) => candidate.slot === slot);
+      return track ? hexColour(track.argb) : undefined;
+    };
+
+    return frame.collisions
+      .filter((c) => c.severity >= threshold)
+      .map((c): CollisionEvent => {
+        const trackAId = this.trackId(c.a);
+        const trackBId = this.trackId(c.b);
+        return {
+          trackAId,
+          trackBId,
+          trackAName: c.aName,
+          trackBName: c.bName,
+          trackAColor: colourOf(c.a),
+          trackBColor: colourOf(c.b),
+          frequencyHz: c.hz,
+          bandwidthHz: c.hz * 0.2,
+          maskingSeverity: c.severity,
+          criticalBand: criticalBandOf(c.hz),
+          description: `${c.aName} and ${c.bName} overlap around ${Math.round(c.hz)} Hz`,
+          suggestedAction: {
+            targetTrackId: trackBId,
+            targetTrackName: c.bName,
+            filterType: 'bell',
+            frequencyHz: c.hz,
+            recommendedGainDb: c.cutDb,
+            q: c.q,
+          },
+        };
+      })
+      .filter((event) => active.has(event.trackAId) && active.has(event.trackBId));
+  }
+
+  public override calculateLoudness(): LoudnessMetrics {
+    const loud = this.frame?.loud;
+    return {
+      momentaryLufs: loud?.m ?? -120,
+      shortTermLufs: loud?.s ?? -120,
+      integratedLufs: loud?.i ?? -120,
+      truePeakDb: loud?.tp ?? -120,
+      crestFactorDb: 0,
+      loudnessRangeLu: loud?.lra ?? 0,
+    };
+  }
+
+  public override resetLoudness(): void {
+    sendToHost('resetLoudness');
+  }
+
+  public override calculateTrackLoudness(trackId: string): { momentaryLufs: number; truePeakDb: number } {
+    // The host meters only its own instance; other tracks report silence until they publish their own meter
+    const loud = this.frame?.loud;
+    const isSelf = trackId === this.selfTrackId();
+    return {
+      momentaryLufs: isSelf && loud ? loud.m : -120,
+      truePeakDb: isSelf && loud ? loud.tp : -120,
+    };
+  }
+
+  public override calculateStereoMetrics(trackId?: string): StereoMetrics & { lissajousPoints: { x: number; y: number }[] } {
+    const wave = this.waves.get(trackId ?? this.selfTrackId() ?? '');
+    if (!wave) {
+      return { correlation: 0, widthPercent: 0, midLevelDb: -120, sideLevelDb: -120, balance: 0, lissajousPoints: [] };
+    }
+
+    let ll = 0;
+    let rr = 0;
+    let lr = 0;
+    let mid = 0;
+    let side = 0;
+    const n = wave.left.length;
+    for (let i = 0; i < n; i++) {
+      const l = wave.left[i];
+      const r = wave.right[i];
+      ll += l * l;
+      rr += r * r;
+      lr += l * r;
+      const m = (l + r) * Math.SQRT1_2;
+      const s = (l - r) * Math.SQRT1_2;
+      mid += m * m;
+      side += s * s;
+    }
+
+    const denominator = Math.sqrt(ll * rr);
+    const step = Math.max(1, Math.floor(n / 256));
+    const lissajousPoints: { x: number; y: number }[] = [];
+    for (let i = 0; i < n; i += step) lissajousPoints.push({ x: wave.left[i], y: wave.right[i] });
+
+    return {
+      correlation: denominator > 1e-12 ? lr / denominator : 0,
+      widthPercent: Math.min(200, Math.max(0, (200 * side) / (mid + side + 1e-12))),
+      midLevelDb: 10 * Math.log10(Math.max(mid / n, 1e-12)),
+      sideLevelDb: 10 * Math.log10(Math.max(side / n, 1e-12)),
+      balance: (rr - ll) / (ll + rr + 1e-12),
+      lissajousPoints,
+    };
+  }
+
+  public override getTrackPeak(trackId: string): { peakPos: number; peakNeg: number; maxPeak: number } {
+    const wave = this.waves.get(trackId);
+    if (!wave) return { peakPos: 0, peakNeg: 0, maxPeak: 0 };
+
+    let peakPos = 0;
+    let peakNeg = 0;
+    for (let i = 0; i < wave.left.length; i++) {
+      peakPos = Math.max(peakPos, wave.left[i], wave.right[i]);
+      peakNeg = Math.min(peakNeg, wave.left[i], wave.right[i]);
+    }
+    return { peakPos, peakNeg, maxPeak: Math.max(peakPos, Math.abs(peakNeg)) };
+  }
+}
+
+// Singleton Engine Instance: the browser runs the Web Audio engine, the plugin host runs the PluginAudioEngine
+export const audioEngine: AudioEngine = isPluginHost() ? new PluginAudioEngine() : new AudioEngine();

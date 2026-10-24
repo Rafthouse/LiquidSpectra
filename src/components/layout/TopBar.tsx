@@ -5,6 +5,10 @@
 
 import React, { useState } from 'react';
 import { ModuleMode } from '../../types/audio';
+import { isPluginHost } from '../../plugin/pluginBridge';
+
+// Inside the plugin the DAW owns transport, and the C++ export tab is a web-only page
+const pluginHost = isPluginHost();
 import {
   Play,
   Square,
@@ -82,7 +86,7 @@ export const TopBar: React.FC<TopBarProps> = ({
 
       {/* Zone 2: Module Mode Navigation Links (Zero Scrollbar Guaranteed) */}
       <nav className="flex items-center gap-1 p-1 rounded-xl bg-slate-100/80 dark:bg-slate-800/80 border border-slate-200/50 dark:border-white/5 flex-nowrap shrink-0 overflow-hidden select-none">
-        {MODES.map((m) => {
+        {MODES.filter((m) => !(pluginHost && m.id === 'cpp_export')).map((m) => {
           const isActive = activeMode === m.id;
           return (
             <button
@@ -139,7 +143,8 @@ export const TopBar: React.FC<TopBarProps> = ({
           {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
         </button>
 
-        {/* Primary Master Play / Stop Action */}
+        {/* Primary Master Play / Stop Action: web engine only, the DAW owns transport in the plugin */}
+        {!pluginHost && (
         <button
           onClick={onTogglePlayback}
           className={`px-4 py-2 text-xs font-semibold rounded-xl text-white shadow-md flex items-center gap-2 transition-all whitespace-nowrap shrink-0
@@ -152,6 +157,7 @@ export const TopBar: React.FC<TopBarProps> = ({
           {isPlaying ? <Square className="w-3.5 h-3.5 fill-current" /> : <Play className="w-3.5 h-3.5 fill-current" />}
           <span>{isPlaying ? 'Stop Stems' : 'Play Stems'}</span>
         </button>
+        )}
       </div>
     </header>
 

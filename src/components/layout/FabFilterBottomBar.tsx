@@ -22,6 +22,10 @@ import {
   Eye,
   EyeOff,
 } from 'lucide-react';
+import { isPluginHost } from '../../plugin/pluginBridge';
+
+// Inside the plugin the host owns the audio: microphone, solo/mute and FFT size are not available
+const pluginHost = isPluginHost();
 
 interface FabFilterBottomBarProps {
   settings: AnalyzerSettings;
@@ -120,32 +124,34 @@ export const FabFilterBottomBar: React.FC<FabFilterBottomBarProps> = ({
             </div>
           </div>
 
-          {/* Resolution (FFT Size) */}
-          <div className="flex flex-col gap-1">
-            <span className="text-[10px] uppercase font-semibold text-slate-400 tracking-wider">
-              Роздільність FFT
-            </span>
-            <div className="grid grid-cols-4 gap-1 bg-slate-900 p-1 rounded-xl border border-white/5 text-xs font-mono font-semibold">
-              {[1024, 2048, 4096, 8192].map((size) => (
-                <button
-                  key={size}
-                  onClick={() =>
-                    onUpdateSettings({
-                      ...settings,
-                      fftSize: size as 1024 | 2048 | 4096 | 8192,
-                    })
-                  }
-                  className={`py-1 rounded-lg transition-all text-center ${
-                    settings.fftSize === size
-                      ? 'bg-cyan-500 text-slate-950 font-bold shadow-sm'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  {size}
-                </button>
-              ))}
+          {/* Resolution (FFT Size): the plugin host runs a fixed 4096-point analysis */}
+          {!pluginHost && (
+            <div className="flex flex-col gap-1">
+              <span className="text-[10px] uppercase font-semibold text-slate-400 tracking-wider">
+                Роздільність FFT
+              </span>
+              <div className="grid grid-cols-4 gap-1 bg-slate-900 p-1 rounded-xl border border-white/5 text-xs font-mono font-semibold">
+                {[1024, 2048, 4096, 8192].map((size) => (
+                  <button
+                    key={size}
+                    onClick={() =>
+                      onUpdateSettings({
+                        ...settings,
+                        fftSize: size as 1024 | 2048 | 4096 | 8192,
+                      })
+                    }
+                    className={`py-1 rounded-lg transition-all text-center ${
+                      settings.fftSize === size
+                        ? 'bg-cyan-500 text-slate-950 font-bold shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {size}
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
 
           {/* Octave Smoothing */}
           <div className="flex flex-col gap-1">
@@ -292,16 +298,18 @@ export const FabFilterBottomBar: React.FC<FabFilterBottomBarProps> = ({
             </div>
 
             <div className="flex items-center gap-2">
-              <button
-                onClick={onToggleMic}
-                className={`px-2 py-0.5 rounded text-[11px] font-semibold border flex items-center gap-1 transition-all ${
-                  isMicActive
-                    ? 'bg-rose-500/20 text-rose-300 border-rose-500/40'
-                    : 'bg-slate-900 text-slate-400 border-white/10 hover:text-white'
-                }`}
-              >
-                <span>Мікрофон {isMicActive ? 'ON' : 'OFF'}</span>
-              </button>
+              {!pluginHost && (
+                <button
+                  onClick={onToggleMic}
+                  className={`px-2 py-0.5 rounded text-[11px] font-semibold border flex items-center gap-1 transition-all ${
+                    isMicActive
+                      ? 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                      : 'bg-slate-900 text-slate-400 border-white/10 hover:text-white'
+                  }`}
+                >
+                  <span>Мікрофон {isMicActive ? 'ON' : 'OFF'}</span>
+                </button>
+              )}
               <button onClick={() => setActivePopover(null)} className="text-slate-400 hover:text-white">
                 <X className="w-3.5 h-3.5" />
               </button>
@@ -327,31 +335,36 @@ export const FabFilterBottomBar: React.FC<FabFilterBottomBarProps> = ({
                 {/* Controls: Solo, Mute, Visibility (Multi-analyzer display controls) */}
                 <div className="flex items-center gap-1.5 shrink-0">
 
-                  {/* Solo Button (S) */}
-                  <button
-                    onClick={() => handleToggleSolo(t)}
-                    className={`w-6 h-6 rounded text-[11px] font-bold font-mono transition-all flex items-center justify-center ${
-                      t.isSolo
-                        ? 'bg-amber-500 text-slate-950 font-extrabold shadow-sm'
-                        : 'bg-slate-800 text-slate-400 hover:text-white'
-                    }`}
-                    title="Solo"
-                  >
-                    S
-                  </button>
+                  {/* Solo and mute only route the web engine's own tracks; the plugin host does not use them */}
+                  {!pluginHost && (
+                    <>
+                      {/* Solo Button (S) */}
+                      <button
+                        onClick={() => handleToggleSolo(t)}
+                        className={`w-6 h-6 rounded text-[11px] font-bold font-mono transition-all flex items-center justify-center ${
+                          t.isSolo
+                            ? 'bg-amber-500 text-slate-950 font-extrabold shadow-sm'
+                            : 'bg-slate-800 text-slate-400 hover:text-white'
+                        }`}
+                        title="Solo"
+                      >
+                        S
+                      </button>
 
-                  {/* Mute Button (M) */}
-                  <button
-                    onClick={() => onUpdateTrack({ ...t, isMuted: !t.isMuted })}
-                    className={`w-6 h-6 rounded text-[11px] font-bold font-mono transition-all flex items-center justify-center ${
-                      t.isMuted
-                        ? 'bg-rose-500 text-white font-extrabold shadow-sm'
-                        : 'bg-slate-800 text-slate-400 hover:text-white'
-                    }`}
-                    title="Mute"
-                  >
-                    M
-                  </button>
+                      {/* Mute Button (M) */}
+                      <button
+                        onClick={() => onUpdateTrack({ ...t, isMuted: !t.isMuted })}
+                        className={`w-6 h-6 rounded text-[11px] font-bold font-mono transition-all flex items-center justify-center ${
+                          t.isMuted
+                            ? 'bg-rose-500 text-white font-extrabold shadow-sm'
+                            : 'bg-slate-800 text-slate-400 hover:text-white'
+                        }`}
+                        title="Mute"
+                      >
+                        M
+                      </button>
+                    </>
+                  )}
 
                   {/* Visibility Eyeball */}
                   <button

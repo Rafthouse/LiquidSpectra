@@ -6,6 +6,15 @@ import {defineConfig} from 'vite';
 export default defineConfig(() => {
   return {
     plugins: [react(), tailwindcss()],
+    build: {
+      // The plugin build is one self-contained page (see scripts/build-plugin-web.mjs):
+      // no code splitting, so lazy imports are bundled into the same script
+      rolldownOptions: {
+        output: {
+          codeSplitting: process.env.LIQUIDSPECTRA_PLUGIN === '1' ? false : undefined,
+        },
+      },
+    },
     resolve: {
       alias: {
         '@': path.resolve(import.meta.dirname, '.'),

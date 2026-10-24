@@ -9,6 +9,7 @@
 #include "SpectralAnalyzerDSP.h"
 #include "CollisionDetector.h"
 #include "LoudnessMeterEBU.h"
+#include <memory>
 #include "MultiInstanceBus.h"
 
 using namespace LiquidAudio;
@@ -230,7 +231,9 @@ namespace
 
     void testBusRegistration()
     {
-        MultiInstanceBus bus;
+        // Heap-allocated: the bus holds per-slot waveform rings and is too large for the stack
+        auto busPtr = std::make_unique<MultiInstanceBus>();
+        auto& bus = *busPtr;
         int owner1 = 0, owner2 = 0;
         const int id1 = bus.registerInstance (&owner1);
         const int id2 = bus.registerInstance (&owner2);
@@ -263,7 +266,8 @@ namespace
     {
         // A writer publishes frames whose bands all hold the same value; a reader must never
         // observe a torn frame mixing two different publications.
-        MultiInstanceBus bus;
+        auto busPtr = std::make_unique<MultiInstanceBus>();
+        auto& bus = *busPtr;
         int owner = 0;
         const int id = bus.registerInstance (&owner);
         std::atomic<bool> done { false };

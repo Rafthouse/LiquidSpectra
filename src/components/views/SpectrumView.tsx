@@ -14,7 +14,11 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { AudioTrack, AnalyzerSettings, FrequencyScale, DisplayRange, DISPLAY_RANGE_PRESETS, CollisionEvent } from '../../types/audio';
 import { audioEngine } from '../../audio/AudioEngine';
+import { isPluginHost } from '../../plugin/pluginBridge';
 import { MasterMeterStrip } from '../common/MasterMeterStrip';
+
+// Inside the plugin there is no tone generator: the analysed signal is the DAW's own
+const pluginHost = isPluginHost();
 import {
   Activity,
   BarChart3,
@@ -1216,7 +1220,8 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
               ))}
             </div>
 
-            {/* Pure Tone Generator Widget */}
+            {/* Pure Tone Generator Widget (web engine only: the plugin analyses the DAW's own signal) */}
+            {!pluginHost && (
             <div className="flex items-center gap-1 bg-slate-900/90 backdrop-blur-xl px-1.5 py-0.5 rounded-lg border border-white/10 shadow-lg">
               <Radio className="w-3 h-3 text-cyan-400" />
               <span className="text-[10px] uppercase font-semibold text-slate-400 hidden lg:inline">Test:</span>
@@ -1277,6 +1282,7 @@ export const SpectrumView: React.FC<SpectrumViewProps> = ({
                 </button>
               )}
             </div>
+            )}
           </div>
         </div>
 

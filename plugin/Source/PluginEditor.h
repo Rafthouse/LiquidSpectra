@@ -59,7 +59,12 @@ private:
     void commitRename();
     void cycleTrackColour();
 
-    juce::Path buildSpectrumCurve (const std::array<float, SpectralAnalyzerDSP::NUM_BINS>& data, juce::Rectangle<float> bounds) const;
+    void showDisplayMenu();
+    void applyDisplayMenu (int menuId);
+    void smoothSpectrum();
+    void ensureSonogramRows();
+    std::vector<float> computeStepLevels (const std::array<float, SpectralAnalyzerDSP::NUM_BINS>& data, juce::Rectangle<float> bounds);
+    juce::Path buildLevelPath (const std::vector<float>& levels, juce::Rectangle<float> bounds, bool stepped) const;
     float freqToX (float freqHz, juce::Rectangle<float> bounds) const noexcept;
     float freqToY (float freqHz, juce::Rectangle<float> bounds) const noexcept;
     float dbToY (float db, juce::Rectangle<float> bounds) const noexcept;
@@ -67,12 +72,14 @@ private:
 
     LiquidSpectraAudioProcessor& audioProcessor;
     ViewMode viewMode { ViewMode::spectrum };
+    DisplaySettings displaySettings;
 
     // Controls (children; bounds are set in resized())
     std::array<juce::TextButton, 6> modeButtons;
     juce::TextButton freezeButton { "Freeze" };
     juce::TextButton overlayButton { "Overlay" };
     juce::TextButton peakButton { "Peak" };
+    juce::TextButton displayButton { "Display" };
     juce::ComboBox floorBox;
     juce::ComboBox clashBox;
     juce::ComboBox targetBox;
@@ -89,6 +96,15 @@ private:
     // GUI-thread copies of the analyser output
     std::array<float, SpectralAnalyzerDSP::NUM_BINS> spectrumDb {};
     std::array<float, SpectralAnalyzerDSP::NUM_BINS> peakSpectrumDb {};
+    std::array<float, SpectralAnalyzerDSP::NUM_BINS> displayDb {};  // smoothed copy used for drawing
+    std::vector<double> powerPrefix;                               // prefix sums for octave smoothing
+
+    // Cached frequency tables (rebuilt only when the scale or width changes)
+    std::vector<float> sonogramRowFreq;
+    int sonogramRowScale { -1 };
+    std::vector<float> stepFreq;
+    int stepFreqScale { -1 };
+    int stepFreqCount { -1 };
     std::array<TrackSnapshot, MAX_SIMULTANEOUS_TRACKS> busTracks {};
     int numBusTracks { 0 };
     std::vector<CollisionResult> collisions;

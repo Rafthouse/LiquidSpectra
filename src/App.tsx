@@ -4,13 +4,20 @@
  * EBU R128 loudness metering, stereo goniometer, synchronized oscilloscope, and C++20 VST3/AU architecture.
  */
 
-import { lazy, Suspense, useState, useEffect } from 'react';
+import { lazy, Suspense, useState, useEffect, useRef } from 'react';
 import {
   AudioTrack,
   AnalyzerSettings,
   ModuleMode,
 } from './types/audio';
 import { audioEngine } from './audio/AudioEngine';
+import {
+  isPluginHost,
+  onHostRestore,
+  saveHostState,
+  sendToHost,
+  subscribeFrames,
+} from './plugin/pluginBridge';
 import { TopBar } from './components/layout/TopBar';
 import { FabFilterBottomBar } from './components/layout/FabFilterBottomBar';
 
@@ -151,8 +158,36 @@ const DEFAULT_SETTINGS: AnalyzerSettings = {
   displayRange: '90dB',
 };
 
+// Plugin host: each instance on the plugin bus is one track (id stable per slot)
+function pluginTrack(slot: number, name: string, argb: number, previous: AudioTrack[]): AudioTrack {
+  const id = `plugin-${slot}`;
+  const color = `#${(argb & 0xffffff).toString(16).padStart(6, '0')}`;
+  const base: AudioTrack = {
+    id,
+    name,
+    color,
+    glowColor: `${color}66`,
+    volume: 1,
+    pan: 0,
+    isMuted: false,
+    isSolo: false,
+    isVisible: true,
+    isSidechainActive: false,
+    type: 'custom',
+    filterEnabled: false,
+    filterFreq: 1000,
+    filterGain: 0,
+    filterQ: 1,
+    peakLevelDb: -120,
+    rmsLevelDb: -120,
+    dominantFrequency: 0,
+  };
+  const existing = previous.find((t) => t.id === id);
+  return { ...(existing ?? base), name, color, glowColor: `${color}66` };
+}
+
 export default function App() {
-  const [tracks, setTracks] = useState<AudioTrack[]>(INITIAL_TRACKS);
+  const [tracks, setTracks] = useState<AudioTrack[]>(() => (isPluginHost() ? [] : INITIAL_TRACKS));
   const [settings, setSettings] = useState<AnalyzerSettings>(DEFAULT_SETTINGS);
   const [activeMode, setActiveMode] = useState<ModuleMode>('spectrum');
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
@@ -196,6 +231,50 @@ export default function App() {
         // Engine awaits user gesture
       });
   }, []);
+
+  // Plugin host: the track list mirrors the instances on the plugin bus
+  useEffect(() => {
+    if (!isPluginHost()) return;
+    return subscribeFrames((frame) => {
+      setTracks((prev) => {
+        const next = frame.tracks.map((track) => pluginTrack(track.slot, track.name, track.argb, prev));
+        const unchanged =
+          next.length === prev.length &&
+          next.every((t, i) => t.id === prev[i].id && t.name === prev[i].name && t.color === prev[i].color);
+        return unchanged ? prev : next;
+      });
+    });
+  }, []);
+
+  // Plugin host: waveforms are only pushed while a scope view is on screen
+  useEffect(() => {
+    if (!isPluginHost()) return;
+    sendToHost('wantWaveform', { value: activeMode === 'stereo' || activeMode === 'oscilloscope' });
+  }, [activeMode]);
+
+  // Plugin host: restore the web UI state saved in the project, then keep saving changes into it
+  const hostRestored = useRef(false);
+  useEffect(() => {
+    if (!isPluginHost()) return;
+    onHostRestore((state) => {
+      const saved = state as Partial<{
+        settings: AnalyzerSettings;
+        activeMode: ModuleMode;
+        isDark: boolean;
+        zoomScale: number;
+      }> | null;
+      if (saved?.settings) setSettings({ ...DEFAULT_SETTINGS, ...saved.settings });
+      if (saved?.activeMode) setActiveMode(saved.activeMode);
+      if (typeof saved?.isDark === 'boolean') setIsDark(saved.isDark);
+      if (typeof saved?.zoomScale === 'number') setZoomScale(saved.zoomScale);
+      hostRestored.current = true;
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!isPluginHost() || !hostRestored.current) return;
+    saveHostState({ settings, activeMode, isDark, zoomScale });
+  }, [settings, activeMode, isDark, zoomScale]);
 
   // Sync FFT size updates to AudioEngine
   useEffect(() => {

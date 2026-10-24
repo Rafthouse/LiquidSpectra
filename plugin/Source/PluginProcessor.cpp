@@ -1,5 +1,5 @@
 #include "PluginProcessor.h"
-#include "PluginEditor.h"
+#include "PluginWebEditor.h"
 
 namespace LiquidAudio {
 
@@ -71,10 +71,19 @@ void LiquidSpectraAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer
         const auto* const* channels = mainInput.getArrayOfReadPointers();
         spectralAnalyzer.pushSamples (channels, numChannels, numSamples);
         loudnessMeter.processBlock (channels, numChannels, numSamples);
-        sampleRing.push (channels[0], numChannels > 1 ? channels[1] : channels[0], numSamples);
 
         const auto& bark = spectralAnalyzer.getLatestBarkMagnitudes();
         getSharedBus().publishSpectrum (instanceId, bark.data(), (int) bark.size());
+
+        // Full spectrum and waveform for the web UI; the spectrum is only copied when a new frame exists
+        const auto frameVersion = spectralAnalyzer.getFrameVersion();
+        if (frameVersion != lastPublishedFrameVersion)
+        {
+            lastPublishedFrameVersion = frameVersion;
+            const auto& spectrum = spectralAnalyzer.getLatestSpectrumDb();
+            getSharedBus().publishFullSpectrum (instanceId, spectrum.data(), (int) spectrum.size());
+        }
+        getSharedBus().pushWaveform (instanceId, channels[0], numChannels > 1 ? channels[1] : channels[0], numSamples);
     }
 
     // Pure analyser: main audio passes through untouched; clear any extra output channels
@@ -140,6 +149,19 @@ void LiquidSpectraAudioProcessor::getStateInformation (juce::MemoryBlock& destDa
     state.setProperty ("showOverlay", getShowOverlay(), nullptr);
     state.setProperty ("clashThreshold", (double) getClashThreshold(), nullptr);
 
+    const auto display = getDisplaySettings();
+    state.setProperty ("frequencyScale", display.frequencyScale, nullptr);
+    state.setProperty ("smoothing", display.smoothing, nullptr);
+    state.setProperty ("tilt", display.tilt, nullptr);
+    state.setProperty ("spectrumStyle", display.spectrumStyle, nullptr);
+    state.setProperty ("decay", display.decay, nullptr);
+    state.setProperty ("palette", display.palette, nullptr);
+    state.setProperty ("sonogramSpeed", display.sonogramSpeed, nullptr);
+    state.setProperty ("triggerMode", display.triggerMode, nullptr);
+    state.setProperty ("pianoRoll", display.pianoRoll, nullptr);
+    state.setProperty ("collisionOverlay", display.collisionOverlay, nullptr);
+    state.setProperty ("webState", getWebState(), nullptr);
+
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
 }
@@ -169,11 +191,47 @@ void LiquidSpectraAudioProcessor::setStateInformation (const void* data, int siz
         setShowOverlay ((bool) state["showOverlay"]);
     if (state.hasProperty ("clashThreshold"))
         setClashThreshold ((float) (double) state["clashThreshold"]);
+
+    // Missing or out-of-range values keep the defaults; each field is clamped to its choices
+    auto display = getDisplaySettings();
+    auto readInt = [&state] (const char* name, int& field, int lo, int hi)
+    {
+        if (state.hasProperty (name))
+            field = juce::jlimit (lo, hi, (int) state[name]);
+    };
+    readInt ("frequencyScale", display.frequencyScale, 0, 3);
+    readInt ("smoothing", display.smoothing, 0, 6);
+    readInt ("tilt", display.tilt, 0, 2);
+    readInt ("spectrumStyle", display.spectrumStyle, 0, 2);
+    readInt ("decay", display.decay, 0, 3);
+    readInt ("palette", display.palette, 0, 4);
+    readInt ("sonogramSpeed", display.sonogramSpeed, 1, 5);
+    readInt ("triggerMode", display.triggerMode, 0, 2);
+    if (state.hasProperty ("pianoRoll"))
+        display.pianoRoll = (bool) state["pianoRoll"];
+    if (state.hasProperty ("collisionOverlay"))
+        display.collisionOverlay = (bool) state["collisionOverlay"];
+    setDisplaySettings (display);
+
+    if (state.hasProperty ("webState"))
+        setWebState (state["webState"].toString());
+}
+
+void LiquidSpectraAudioProcessor::setWebState (const juce::String& json)
+{
+    const juce::SpinLock::ScopedLockType lock (webStateLock);
+    webState = json;
+}
+
+juce::String LiquidSpectraAudioProcessor::getWebState() const
+{
+    const juce::SpinLock::ScopedLockType lock (webStateLock);
+    return webState;
 }
 
 juce::AudioProcessorEditor* LiquidSpectraAudioProcessor::createEditor()
 {
-    return new LiquidSpectraAudioProcessorEditor (*this);
+    return new LiquidSpectraWebEditor (*this);
 }
 
 } // namespace LiquidAudio
