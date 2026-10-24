@@ -7,3 +7,5 @@ coverage/
 .env*
 !.env.example
 plugin/build/
+dist-windows/
+dist-macos/

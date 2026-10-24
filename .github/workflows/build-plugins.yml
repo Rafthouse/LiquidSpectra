@@ -1,0 +1,102 @@
+name: Build & Package LiquidSpectra Installers (Windows & macOS)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows installer (x64 MSVC)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake (Release x64)
+        run: cmake -B build -A x64
+
+      - name: Build (VST3, Standalone, tests)
+        run: cmake --build build --config Release --parallel
+
+      - name: Run DSP unit tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: |
+          $is = Join-Path $env:TEMP 'innosetup.exe'
+          Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $is
+          Start-Process -FilePath $is -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+          if (-not (Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe')) { throw 'Inno Setup install failed: ISCC.exe not found' }
+
+      - name: Compile Windows installer (.exe)
+        shell: powershell
+        run: & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer\LiquidSpectra.iss
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiquidSpectra-Windows-x64
+          path: |
+            dist-windows/*
+          retention-days: 14
+
+  macos:
+    name: macOS installer (Universal arm64 + x86_64)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake (Universal)
+        run: |
+          cmake -B build -G Xcode \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="11.0"
+
+      - name: Build (VST3, AU, Standalone, tests)
+        run: cmake --build build --config Release --parallel
+
+      - name: Run DSP unit tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Stage pkg root
+        run: |
+          mkdir -p pkgroot/Library/Audio/Plug-Ins/VST3
+          mkdir -p pkgroot/Library/Audio/Plug-Ins/Components
+          cp -R "build/LiquidSpectra_artefacts/Release/VST3/LiquidSpectra.vst3" pkgroot/Library/Audio/Plug-Ins/VST3/
+          cp -R "build/LiquidSpectra_artefacts/Release/AU/LiquidSpectra.component" pkgroot/Library/Audio/Plug-Ins/Components/
+
+      - name: Build installer .pkg
+        run: |
+          mkdir -p dist-macos
+          pkgbuild --root pkgroot \
+            --identifier com.liquidaudio.liquidspectra \
+            --version 1.2.0 \
+            --install-location / \
+            "dist-macos/LiquidSpectra-1.2.0.pkg"
+
+      - name: Build standalone .dmg
+        run: |
+          brew install create-dmg
+          mkdir -p dmg-stage
+          cp -R "build/LiquidSpectra_artefacts/Release/Standalone/LiquidSpectra.app" dmg-stage/
+          create-dmg \
+            --volname "LiquidSpectra" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "LiquidSpectra.app" 200 190 \
+            --hide-extension "LiquidSpectra.app" \
+            --app-drop-link 400 190 \
+            "dist-macos/LiquidSpectra-1.2.0.dmg" \
+            "dmg-stage/"
+
+      - name: Upload macOS installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiquidSpectra-macOS-Universal
+          path: |
+            dist-macos/*
+          retention-days: 14
