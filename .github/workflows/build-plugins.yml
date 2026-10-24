@@ -1,4 +1,4 @@
-name: Build & Package LiquidSpectra Installers (Windows & macOS)
+name: Build and Package LiquidSpectra Installers (Windows and macOS)
 
 on:
   push:
@@ -32,7 +32,8 @@ jobs:
 
       - name: Compile Windows installer (.exe)
         shell: powershell
-        run: & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer\LiquidSpectra.iss
+        run: |
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer\LiquidSpectra.iss
 
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
